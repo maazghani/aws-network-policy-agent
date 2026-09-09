@@ -27,9 +27,12 @@ type EbpfFirewallRules struct {
 	Priority   int
 	Action     v1alpha1.ClusterNetworkPolicyRuleAction
 	DomainName string
-	IPCidr     v1alpha1.NetworkAddress
-	Except     []v1alpha1.NetworkAddress
-	L4Info     []v1alpha1.Port
+	// PolicyOwner is the immutable PolicyEndpoint contribution, used only by
+	// endpoint-local FQDN policy. Static LPM maps never contain learned grants.
+	PolicyOwner string
+	IPCidr      v1alpha1.NetworkAddress
+	Except      []v1alpha1.NetworkAddress
+	L4Info      []v1alpha1.Port
 }
 
 type FirewallRuleProcessor struct {
@@ -88,6 +91,9 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	sortFirewallRulesByPrefixLength(firewallRules, f.hostMask)
 
 	for _, firewallRule := range firewallRules {
+		if firewallRule.DomainName != "" {
+			continue
+		}
 		var cidrL4Info []v1alpha1.Port
 
 		if !strings.Contains(string(firewallRule.IPCidr), "/") {

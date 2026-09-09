@@ -19,7 +19,10 @@ RUN go mod download
 
 COPY . ./
 
-RUN make build-linux
+# The buildx Go stage runs on BUILDPLATFORM. Cross-compile every executable for
+# the image platform; these Go packages use the SDK's syscall implementation and
+# do not need a cross C compiler.
+RUN make build-linux GO_ARCH="${TARGETARCH}" CGO_ENABLED=0
 
 # Vmlinux
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 as vmlinuxbuilder
@@ -36,7 +39,7 @@ RUN make vmlinuxh
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 as bpfbuilder
 WORKDIR /bpfbuilder
 RUN yum update -y && \
-    yum install -y iproute procps-ng && \
+    yum install -y iproute procps-ng iptables && \
     yum install -y llvm clang make gcc && \
     yum install -y kernel-devel elfutils-libelf-devel zlib-devel libbpf-devel && \
     yum clean all
@@ -44,11 +47,15 @@ RUN yum update -y && \
 COPY . ./
 COPY --from=vmlinuxbuilder /vmlinuxbuilder/pkg/ebpf/c/vmlinux.h ./pkg/ebpf/c/
 RUN make build-bpf
+RUN ./scripts/package-fqdn-netfilter.sh /fqdn-rootfs
 
 # Container base image
 FROM ${base_image}
 
 WORKDIR /
+COPY --from=bpfbuilder /fqdn-rootfs/ /
+# xtables initializes netfilter even for --version. Execute it in native kernel
+# qualification; the arm64 QEMU cross-build cannot open that protocol.
 COPY --from=builder /workspace/controller .
 COPY --from=builder /workspace/aws-eks-na-cli .
 COPY --from=builder /workspace/aws-eks-na-cli-v6 .

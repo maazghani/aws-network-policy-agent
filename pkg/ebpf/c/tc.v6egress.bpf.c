@@ -327,8 +327,10 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 	return BPF_DROP;
 }
 
-SEC("tc_cls")
-int handle_egress(struct __sk_buff *skb)
+#define FQDN_IPV6
+#include "fqdn_egress.h"
+
+static __noinline int legacy_handle_egress(struct __sk_buff *skb)
 {
 	
 	struct keystruct trie_key;
@@ -355,7 +357,7 @@ int handle_egress(struct __sk_buff *skb)
 		struct ipv6hdr *ip = data;
 		struct tcphdr *l4_tcp_hdr = data + sizeof(struct ipv6hdr);
 		struct udphdr *l4_udp_hdr = data + sizeof(struct ipv6hdr);
-		struct sctphdr *l4_sctp_hdr = data + sizeof(struct ipv6hdr);
+		struct aws_sctphdr *l4_sctp_hdr = data + sizeof(struct ipv6hdr);
 
 		if (data + sizeof(*ip) > data_end) {
 			return BPF_OK;
@@ -481,5 +483,15 @@ int handle_egress(struct __sk_buff *skb)
 	return BPF_OK;
 }
 
-const volatile __u32 NPA_FILE_VERSION = 2;
+/* Keep the legacy and enrolled paths in separate stack frames. */
+SEC("tc_cls")
+int handle_egress(struct __sk_buff *skb)
+{
+    int result = fqdn_handle_egress(skb);
+    if (result != FQDN_DEFER)
+        return result;
+    return legacy_handle_egress(skb);
+}
+
+const volatile __u32 NPA_FILE_VERSION = 3;
 char _license[] SEC("license") = "GPL";
