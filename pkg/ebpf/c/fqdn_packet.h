@@ -16,12 +16,44 @@ struct fqdn_packet {
     __u8 essential_icmp;
 };
 
+/* Keep the cursor 64-bit throughout. Truncating an offset for the bounds
+ * comparison while retaining a wide spill defeats verifier range propagation
+ * across variable-length options and causes exponential state exploration.
+ */
+static __noinline int fqdn_ipv4_options(void *header, void *end, __u32 ihl)
+{
+    __u64 offset = 20;
+    for (int n = 0; n < 40; n++) {
+        if (offset >= ihl)
+            return 0;
+        if (offset > 59)
+            return -1;
+        __u8 *option = header + offset;
+        if (option + 1 > (__u8 *)end)
+            return -1;
+        __u8 type = option[0];
+        if (!type)
+            return 0;
+        if (type == 1) {
+            offset++;
+            continue;
+        }
+        if (type == 131 || type == 137 || offset + 1 >= ihl || option + 2 > (__u8 *)end)
+            return -1;
+        __u64 length = option[1];
+        if (length < 2 || length > (__u64)ihl - offset)
+            return -1;
+        offset += length;
+    }
+    return offset == ihl ? 0 : -1;
+}
+
 /* At most 32 TLVs per extension header. Reject mobile IPv6 home-address
  * rewriting and jumbograms: neither may change the identity after TC.
  */
 static __noinline int fqdn_ipv6_options(void *header, void *end, __u32 length)
 {
-    __u32 offset = 2;
+    __u64 offset = 2;
     for (int n = 0; n < 32; n++) {
         if (offset >= length)
             return 0;
@@ -34,8 +66,8 @@ static __noinline int fqdn_ipv6_options(void *header, void *end, __u32 length)
         }
         if (option[0] == 201 || option[0] == 194 || option + 2 > (__u8 *)end)
             return -1;
-        __u32 size = (__u32)option[1] + 2;
-        if (size > length - offset)
+        __u64 size = (__u64)option[1] + 2;
+        if (size > (__u64)length - offset)
             return -1;
         offset += size;
     }
@@ -70,27 +102,8 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
         /* Source routing changes the effective destination after this hook.
          * Other options use the validated IHL and bounded TLV parsing.
          */
-        __u32 option_offset = sizeof(*ip);
-        for (int n = 0; n < 40; n++) {
-            if (option_offset >= ihl)
-                break;
-            __u8 *option = (void *)ip + option_offset;
-            if (option + 1 > (__u8 *)end)
-                return -1;
-            __u8 type = option[0];
-            if (!type)
-                break;
-            if (type == 1) {
-                option_offset++;
-                continue;
-            }
-            if (type == 131 || type == 137 || option + 2 > (__u8 *)end)
-                return -1;
-            __u8 length = option[1];
-            if (length < 2 || option_offset + length > ihl)
-                return -1;
-            option_offset += length;
-        }
+        if (fqdn_ipv4_options(ip, end, ihl))
+            return -1;
         p->tuple.family = 4;
         __builtin_memcpy(p->tuple.src, &ip->saddr, 4);
         __builtin_memcpy(p->tuple.dst, &ip->daddr, 4);

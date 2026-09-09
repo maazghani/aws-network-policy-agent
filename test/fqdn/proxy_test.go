@@ -135,6 +135,38 @@ type dnsResult struct {
 	Truncated                 bool
 }
 
+func TestDNSFixtureEncoding(t *testing.T) {
+	for _, family := range []int{4, 6} {
+		answer := "198.18.0.80"
+		kind := uint16(1)
+		if family == 6 {
+			answer = "fd00:2::80"
+			kind = 28
+		}
+		t.Setenv("FQDN_DNS_ANSWER", answer)
+		for _, sample := range []struct {
+			name      string
+			udp       bool
+			addresses int
+		}{{"allowed.test", true, 1}, {"multi.allowed.test", true, 2}, {"truncated.allowed.test", true, 0}, {"truncated.allowed.test", false, 1}, {"negative.allowed.test", true, 0}, {"unmatched.test", true, 1}} {
+			request := make([]byte, 12)
+			binary.BigEndian.PutUint16(request, 1)
+			binary.BigEndian.PutUint16(request[2:], 0x0100)
+			binary.BigEndian.PutUint16(request[4:], 1)
+			request = append(request, benchName(sample.name)...)
+			request = binary.BigEndian.AppendUint16(request, kind)
+			request = binary.BigEndian.AppendUint16(request, 1)
+			parsed, err := fqdn.ParseDNSAnswer(request, dnsFixtureAnswer(request, sample.udp), 1_000_000_000, family)
+			if err != nil {
+				t.Fatalf("fixture IPv%d %s: %v", family, sample.name, err)
+			}
+			if parsed.Question != sample.name || len(parsed.Observations) != sample.addresses {
+				t.Fatalf("fixture IPv%d %s encoded wrong question/address set: %+v", family, sample.name, parsed)
+			}
+		}
+	}
+}
+
 func probeDNS() int {
 	result := dnsResult{}
 	defer func() { _ = json.NewEncoder(os.Stdout).Encode(result) }()

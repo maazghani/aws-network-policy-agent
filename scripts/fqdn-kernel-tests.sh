@@ -17,6 +17,9 @@ if [[ ${1:-} == --isolated ]]; then
     export AWS_EBPF_SDK_LOG_FILE="$repo/test-results/sdk-ipv${family}.jsonl"
     test_status=0
     "$test_binary" -test.v -test.timeout=180s || test_status=$?
+    # These logs contain only synthetic test endpoints. Lumberjack creates them
+    # root-only; make this explicitly created artifact readable by the CI user.
+    if [[ -f "$AWS_EBPF_SDK_LOG_FILE" ]]; then chmod 0644 "$AWS_EBPF_SDK_LOG_FILE"; fi
     if [[ $test_status != 0 ]]; then
         # SDK defaults to a private file. Decode its verifier tail rather than
         # lose the decisive failure behind an errno; retain the full artifact.
