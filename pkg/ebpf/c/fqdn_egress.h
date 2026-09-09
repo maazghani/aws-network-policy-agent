@@ -247,10 +247,19 @@ static __noinline int fqdn_handle_egress(struct __sk_buff *skb)
     int parsed = fqdn_parse(skb, &packet);
     if (parsed < 0)
         return BPF_DROP;
-    if (parsed > 0 || packet.essential_icmp)
+    if (parsed > 0)
         return BPF_OK;
-    if (packet.tuple.family != ep.family || __builtin_memcmp(packet.tuple.src, ep.address, 16))
+    if (packet.tuple.family != ep.family)
         return BPF_DROP;
+    /* ND uses multicast/unspecified addresses. PMTU and other errors retain
+     * the endpoint's assigned address binding.
+     */
+    if (packet.essential_icmp == 2)
+        return BPF_OK;
+    if (__builtin_memcmp(packet.tuple.src, ep.address, 16))
+        return BPF_DROP;
+    if (packet.essential_icmp == 1)
+        return BPF_OK;
 #ifdef FQDN_IPV6
     if (packet.tuple.family != 6)
 #else

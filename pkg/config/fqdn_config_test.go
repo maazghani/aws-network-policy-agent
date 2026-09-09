@@ -31,6 +31,22 @@ func TestFQDNEnablementRequiresNetworkPolicyAndExplicitBudget(t *testing.T) {
 	if err := cfg.ValidControllerFlags(); err != nil {
 		t.Fatal(err)
 	}
+	valid := cfg.FQDN
+	for _, test := range []struct {
+		name  string
+		clear func(*FQDNConfig)
+	}{
+		{"grants-per-endpoint", func(c *FQDNConfig) { c.MaxGrantsPerEndpoint = 0 }},
+		{"total-observations", func(c *FQDNConfig) { c.MaxTotalObservations = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			test.clear(&candidate)
+			if err := candidate.Validate(true); err == nil {
+				t.Fatal("missing budget accepted before datapath initialization")
+			}
+		})
+	}
 	cfg.FQDN.MaxPendingBytes = 65535
 	if err := cfg.ValidControllerFlags(); err == nil {
 		t.Fatal("unbounded/unreservable DNS exchange accepted")

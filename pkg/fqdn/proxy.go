@@ -50,6 +50,7 @@ type Proxy struct {
 	bridge                                                     DNSBridge
 	config                                                     ProxyConfig
 	mu                                                         sync.Mutex
+	budgetMu                                                   sync.Mutex
 	udp                                                        *net.UDPConn
 	tcp                                                        net.Listener
 	steering                                                   *dnsSteering
@@ -112,8 +113,8 @@ func (p *Proxy) Reconcile(ctx context.Context) error {
 }
 
 func (p *Proxy) Stats() ProxyStats {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.budgetMu.Lock()
+	defer p.budgetMu.Unlock()
 	return ProxyStats{Pending: len(p.pending), PendingBytes: p.pendingBytes, TCPSockets: len(p.tcpSlots), UpstreamFailures: p.upstreamFailures.Load(), AuthenticationFailures: p.authenticationFailures.Load(), CapacityFailures: p.capacityFailures.Load()}
 }
 
@@ -125,7 +126,7 @@ func (p *Proxy) Start(parent context.Context) error {
 	if p.cancel != nil {
 		return errors.New("DNS proxy already started")
 	}
-	if err := p.bridge.SetProxyReady(parent, uint32(p.config.Port), p.config.Mark, false); err != nil {
+	if err := p.setReadiness(parent, false); err != nil {
 		return err
 	}
 	steering, err := installDNSSteering(p.config.Family, p.config.Mark, p.config.RouteTable, p.config.RulePriority)
@@ -153,7 +154,7 @@ func (p *Proxy) Start(parent context.Context) error {
 		return err
 	}
 	_ = unix.Close(replyFD)
-	if err = p.bridge.SetProxyReady(parent, uint32(p.config.Port), p.config.Mark, true); err != nil {
+	if err = p.setReadiness(parent, true); err != nil {
 		_ = tcp.Close()
 		_ = udp.Close()
 		_ = steering.close()
@@ -167,6 +168,12 @@ func (p *Proxy) Start(parent context.Context) error {
 	go p.serveTCP(ctx, tcp)
 	go func() { <-ctx.Done(); _ = p.Close() }()
 	return nil
+}
+
+func (p *Proxy) setReadiness(parent context.Context, ready bool) error {
+	ctx, cancel := context.WithTimeout(parent, p.config.ExchangeTimeout)
+	defer cancel()
+	return p.bridge.SetProxyReady(ctx, uint32(p.config.Port), p.config.Mark, ready)
 }
 
 func (p *Proxy) Close() error {
@@ -205,8 +212,8 @@ func (p *Proxy) reserve(size int64) bool {
 		p.capacityFailures.Add(1)
 		return false
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.budgetMu.Lock()
+	defer p.budgetMu.Unlock()
 	if size > p.config.MaxPendingBytes-p.pendingBytes {
 		<-p.pending
 		p.capacityFailures.Add(1)
@@ -215,7 +222,12 @@ func (p *Proxy) reserve(size int64) bool {
 	p.pendingBytes += size
 	return true
 }
-func (p *Proxy) release(size int64) { p.mu.Lock(); p.pendingBytes -= size; p.mu.Unlock(); <-p.pending }
+func (p *Proxy) release(size int64) {
+	p.budgetMu.Lock()
+	p.pendingBytes -= size
+	p.budgetMu.Unlock()
+	<-p.pending
+}
 
 func (p *Proxy) authenticate(ctx context.Context, source, destination netip.AddrPort, protocol uint8) (endpoint Endpoint, retErr error) {
 	started := time.Now()

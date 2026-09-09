@@ -86,7 +86,12 @@ func (e *Engine) bounded(ctx context.Context) (context.Context, context.CancelFu
 }
 
 func validEndpoint(ep Endpoint) bool {
-	return ep.UID != "" && len(ep.UID) <= 512 && ep.IfIndex != 0 && ep.IP.IsValid() && !ep.IP.IsUnspecified() && ep.IP.Zone() == "" && !ep.IP.Is4In6()
+	for _, identity := range []string{ep.UID, ep.Namespace, ep.Name, ep.PodIdentifier} {
+		if len(identity) > 512 {
+			return false
+		}
+	}
+	return ep.UID != "" && ep.IfIndex != 0 && ep.IP.IsValid() && !ep.IP.IsUnspecified() && !ep.IP.IsMulticast() && ep.IP.Zone() == "" && !ep.IP.Is4In6()
 }
 
 func (e *Engine) find(ep Endpoint) (*endpointState, error) {
@@ -446,6 +451,9 @@ func (e *Engine) grants(rules []Rule, observations map[observationKey]Observatio
 				key := grantKey{o.Address, p}
 				g, exists := entries[key]
 				if !exists {
+					if len(entries) >= e.config.Limits.MaxGrantsPerEndpoint || addresses[o.Address] >= e.config.Limits.MaxGrantsPerAddress || addresses[o.Address] == 0 && len(addresses) >= e.config.Limits.MaxAddressesPerEndpoint {
+						return nil, ErrCapacity
+					}
 					g = Grant{Address: o.Address, Protocol: p.Protocol, StartPort: p.StartPort, EndPort: p.EndPort}
 					addresses[o.Address]++
 				}
@@ -454,9 +462,6 @@ func (e *Engine) grants(rules []Rule, observations map[observationKey]Observatio
 					g.Names = append(g.Names, o.Name)
 				}
 				entries[key] = g
-				if len(entries) > e.config.Limits.MaxGrantsPerEndpoint || len(addresses) > e.config.Limits.MaxAddressesPerEndpoint || addresses[o.Address] > e.config.Limits.MaxGrantsPerAddress {
-					return nil, ErrCapacity
-				}
 			}
 		}
 	}
@@ -551,25 +556,33 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 	if err != nil {
 		return err
 	}
-	observations := make(map[observationKey]Observation, len(s.observations)+len(answer))
-	for key, o := range s.observations {
-		if o.ExpiresAt > now {
-			observations[key] = o
-		} else {
-			e.expired.Add(1)
-		}
-	}
+	// Validate the whole answer before any capacity fallback can publish it.
 	for _, o := range answer {
 		name, normalizeErr := NormalizeName(o.Name)
 		if normalizeErr != nil || name != questionName || !o.Address.IsValid() || o.Address.IsUnspecified() || o.Address.IsMulticast() || o.Address.Is4In6() || o.Address.Zone() != "" || o.Address.Is4() != ep.IP.Is4() {
 			return ErrNoPermission
 		}
+	}
+	observations := make(map[observationKey]Observation, min(e.config.Limits.MaxObservationsPerEndpoint, len(s.observations)+len(answer)))
+	expired := uint64(0)
+	for key, o := range s.observations {
+		if o.ExpiresAt > now {
+			observations[key] = o
+		} else {
+			expired++
+		}
+	}
+	for _, o := range answer {
 		if o.ExpiresAt <= now {
 			continue
 		}
-		o.Name = name
-		key := observationKey{name, o.Address}
-		if prior, ok := observations[key]; !ok || o.ExpiresAt > prior.ExpiresAt {
+		o.Name = questionName
+		key := observationKey{questionName, o.Address}
+		prior, exists := observations[key]
+		if !exists && len(observations) >= e.config.Limits.MaxObservationsPerEndpoint {
+			return e.publishStatic(ctx, s, answer, matched, releaseResponse, ErrCapacity)
+		}
+		if !exists || o.ExpiresAt > prior.ExpiresAt {
 			observations[key] = o
 		}
 	}
@@ -670,6 +683,8 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 	})
 	if !programmed {
 		_ = e.reserve(s, oldObservations, oldGrants)
+	} else {
+		e.expired.Add(expired)
 	}
 	return err
 }
@@ -684,10 +699,10 @@ func (e *Engine) checkStatic(ctx context.Context, s *endpointState, answer []Obs
 		for _, rule := range matching(s.policy.Rules, o.Name) {
 			for _, port := range rule.Ports {
 				key := grantKey{o.Address, port}
-				entries[key] = Grant{Address: o.Address, Protocol: port.Protocol, StartPort: port.StartPort, EndPort: port.EndPort}
-				if len(entries) > e.config.Limits.MaxGrantsPerEndpoint {
+				if _, exists := entries[key]; !exists && len(entries) >= e.config.Limits.MaxGrantsPerEndpoint {
 					return ErrCapacity
 				}
+				entries[key] = Grant{Address: o.Address, Protocol: port.Protocol, StartPort: port.StartPort, EndPort: port.EndPort}
 			}
 		}
 	}
@@ -746,6 +761,8 @@ func (e *Engine) Stats() Stats {
 func (e *Engine) Expire(ctx context.Context) (err error) {
 	started := time.Now()
 	defer func() { Observe("expiry", started, err) }()
+	ctx, cancel := e.bounded(ctx)
+	defer cancel()
 	e.mu.Lock()
 	states := make([]*endpointState, 0, len(e.endpoints))
 	for _, s := range e.endpoints {

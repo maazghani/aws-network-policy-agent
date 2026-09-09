@@ -149,9 +149,19 @@ func (h *FQDNPolicyHandler) refresh(ctx context.Context, namespace string, enrol
 		pod := live[name]
 		current, alive := h.engine.Lookup(ep.IfIndex, ep.IP)
 		if pod == nil || string(pod.UID) != ep.UID || pod.Status.PodIP != ep.IP.String() || !alive || current != ep {
-			if err := h.engine.Delete(ctx, ep); err != nil {
+			if err := h.engine.Delete(ctx, ep); err != nil && !errors.Is(err, fqdn.ErrEndpoint) {
 				result = errors.Join(result, err)
 				continue
+			}
+			if pod == nil || string(pod.UID) != ep.UID {
+				if forgetter, ok := h.backend.(interface {
+					ForgetFQDNSelection(context.Context, fqdn.Endpoint) error
+				}); ok {
+					if err := forgetter.ForgetFQDNSelection(ctx, ep); err != nil {
+						result = errors.Join(result, err)
+						continue
+					}
+				}
 			}
 			delete(h.endpoints, name)
 		}

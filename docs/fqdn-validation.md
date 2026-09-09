@@ -43,10 +43,19 @@ qualifies that runner only. Record the workflow URL and exact commit with a resu
 | Service/NAT | PREROUTING/OUTPUT DNAT to a non-local resolver; same-source-port UDP with pre-existing NAT state; original Service VIP maintained |
 | Plumbing failure | Listener crash with stale readiness fails closed; local-route deletion cannot forward selected DNS directly |
 | Full DNS path | Actual proxy + engine + backend + TC; duplicate replies; UDP truncation/TCP retry; delayed/failed writes; attachment loss; endpoint deletion during publication; zero premature positive answers |
+| NodeLocal binding | Actual local resolver binds UDP 53 without reuse; raw proxy replies preserve its original tuple without competing for that socket |
+| Packet parsing | Real TC IPv4 options/lengths/fragments; bounded IPv6 extension/TLV traversal; PMTU and essential IPv6 under ingress isolation |
 
 The packet tests do not use Linux conntrack as FQDN authority. Deliberate fault
 injection wraps the real backend to delay or reject an operation; every successful
 operation and active-program/map check still uses the production implementation.
+Selected endpoints reject IP fragments, including IPv6 atomic fragments, source
+routing and unsupported/jumbo IPv6 forms. Supported IPv6 extension traversal is
+bounded to six headers and option parsing is bounded. Essential IPv6 control and
+PMTU packets have explicit validation. UDP DNS replies honor the client's size
+limit, capped at 1232 bytes; larger answers carry truncation with no resource
+records and require TCP retry. Raw UDP replies require `CAP_NET_RAW` and avoid
+binding the local resolver's already occupied port 53.
 Transport echo measurements report a baseline-relative smoke result. Forty samples
 do not establish a production p99 budget.
 

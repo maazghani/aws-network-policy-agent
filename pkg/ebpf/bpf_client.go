@@ -782,6 +782,13 @@ func (l *bpfClient) attacheBPFProbesUnfenced(pod types.NamespacedName, podIdenti
 			return err
 		}
 
+		// Seed replacement selection before either new TC hook can observe traffic.
+		if l.fqdn != nil {
+			if err := l.fqdn.prepareInterfaceSelection(hostVethName, pod.Namespace, pod.Name); err != nil {
+				return err
+			}
+		}
+
 		log().Infof("AttacheBPFProbes for pod %s in namespace %s with hostVethName %s at interface %d", pod.Name, pod.Namespace, hostVethName, index)
 
 		if !isIngressProbeAttached {
@@ -808,11 +815,6 @@ func (l *bpfClient) attacheBPFProbesUnfenced(pod types.NamespacedName, podIdenti
 				return err
 			}
 			log().Infof("Successfully attached Egress TC probe for pod: %s in namespace %s at interface %d", pod.Name, pod.Namespace, index)
-		}
-		if l.fqdn != nil {
-			if err := l.fqdn.releaseInactiveInterface(hostVethName); err != nil {
-				return err
-			}
 		}
 	}
 	if !isIngressProbeAttached {

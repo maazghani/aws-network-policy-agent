@@ -558,6 +558,68 @@ func TestOnlySuccessfullyAppliedPolicyRejectionIsRecoverable(t *testing.T) {
 	}
 }
 
+func TestCapacityFallbackValidatesAllReturnedAddressesBeforePublication(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	e.config.Limits.MaxObservationsPerEndpoint = 2
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute), observation(clock, "192.0.2.11", time.Minute))
+	static := &testStaticBackend{testBackend: b, allowed: true}
+	e.backend = static
+	answer := []Observation{observation(clock, "192.0.2.12", time.Minute), observation(clock, "0.0.0.0", time.Minute)}
+	if err := e.Publish(context.Background(), ep, "api.example.com", answer, func(context.Context, []uint32) error {
+		t.Fatal("capacity fallback released unvalidated later address")
+		return nil
+	}); !errors.Is(err, ErrNoPermission) {
+		t.Fatal(err)
+	}
+	if static.staticChecks != 0 {
+		t.Fatal("invalid answer reached static fallback")
+	}
+}
+
+func TestExpiryPassHasOneTotalMaintenanceDeadline(t *testing.T) {
+	e, b, clock, first := stateFixture(t)
+	second := first
+	second.UID = "pod-b"
+	second.IfIndex++
+	second.IP = netip.MustParseAddr("10.0.0.11")
+	second, err := e.Enroll(context.Background(), second, Snapshot{Rules: []Rule{allowRule("owner", "api.example.com", 443)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, first, observation(clock, "192.0.2.10", time.Second))
+	publish(t, e, second, observation(clock, "192.0.2.11", time.Second))
+	clock.now.Add(uint64(2 * time.Second))
+	e.config.PublicationTimeout = 20 * time.Millisecond
+	calls := 0
+	b.replace = func(ctx context.Context) error { calls++; <-ctx.Done(); return ctx.Err() }
+	if err := e.Expire(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expiry multiplied timeout across endpoints: %d blocked operations", calls)
+	}
+}
+
+func TestFailedProgrammingDoesNotCountUnreclaimedExpiry(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Second))
+	clock.now.Add(uint64(2 * time.Second))
+	b.replace = func(context.Context) error { return errors.New("map unavailable") }
+	if err := e.Publish(context.Background(), ep, "api.example.com", []Observation{observation(clock, "192.0.2.11", time.Minute)}, func(context.Context, []uint32) error { return nil }); err == nil {
+		t.Fatal("expected map failure")
+	}
+	if e.Stats().Expired != 0 {
+		t.Fatal("failed cleanup overcounted reclaimed expiry")
+	}
+	b.replace = nil
+	if err := e.Expire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if e.Stats().Expired != 1 {
+		t.Fatal("successful expiry not counted")
+	}
+}
+
 // This benchmark measures only the userspace engine with an in-memory backend.
 // It is not a DNS QPS, BPF admission, packet-cost, or production budget claim.
 func BenchmarkStatePublishOneAddress(b *testing.B) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -44,6 +45,7 @@ func (m *fqdnSDKMap) Keys() ([]string, error) { return fqdnMapKeys(m.m) }
 func (m *fqdnSDKMap) ID() uint32              { return m.m.MapID }
 
 type fqdnBinding struct {
+	committed    bool
 	endpoint     fqdn.Endpoint
 	revision     uint64
 	grants       map[fqdnGrantKey]fqdnGrantValue
@@ -56,14 +58,16 @@ type fqdnBinding struct {
 // APIs. A successful response cannot race an agent-owned static-map refresh.
 // Only NewFQDNBackend enables this path; existing BpfClient callers remain valid.
 type FQDNBackend struct {
-	readPolicy func(fqdn.Endpoint, netip.Addr) (fqdnStaticPolicy, error)
-	client     *bpfClient
-	staging    bool
-	gate       chan struct{}
-	maps       map[string]fqdnMap
-	bound      map[uint32]*fqdnBinding
-	verify     func(context.Context, fqdn.Endpoint) error
-	now        func() (uint64, error)
+	selectionMu sync.Mutex
+	selections  map[string]fqdn.Endpoint
+	readPolicy  func(fqdn.Endpoint, netip.Addr) (fqdnStaticPolicy, error)
+	client      *bpfClient
+	stages      map[string]map[string]bool
+	gate        chan struct{}
+	maps        map[string]fqdnMap
+	bound       map[uint32]*fqdnBinding
+	verify      func(context.Context, fqdn.Endpoint) error
+	now         func() (uint64, error)
 }
 
 var _ fqdn.Backend = (*FQDNBackend)(nil)
@@ -220,6 +224,9 @@ func (b *FQDNBackend) Bind(ctx context.Context, ep fqdn.Endpoint) error {
 	if err := b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
 		return fmt.Errorf("bind restrictive endpoint: %w", err)
 	}
+	if err := b.rememberSelection(ep, true); err != nil {
+		return err
+	}
 	b.bound[ep.IfIndex] = &fqdnBinding{endpoint: ep, grants: map[fqdnGrantKey]fqdnGrantValue{}, flowNames: map[fqdnFlowKey][]string{}}
 	// The selected datapath bypasses legacy conntrack from this point. Delete
 	// legacy entries as well, preventing their later resurrection on rollback.
@@ -240,6 +247,9 @@ func (b *FQDNBackend) ReconcilePolicy(ctx context.Context, ep fqdn.Endpoint, pol
 	if err != nil {
 		return err
 	}
+	if policy.Revision != s.revision {
+		s.committed = false
+	}
 	s.policy = policy
 	return nil
 }
@@ -254,10 +264,22 @@ func (b *FQDNBackend) Replace(ctx context.Context, ep fqdn.Endpoint, revision ui
 		return err
 	}
 	v := fqdnEndpointValue{Lifetime: ep.Lifetime, Generation: revision, Address: fqdnAddress(ep.IP), Family: fqdnFamily(ep.IP), Flags: fqdnEndpointSelected}
-	// First invalidate old authority. Even failed replacement cannot preserve
-	// removed permissions; if this restrictive write fails, report failure.
-	if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
-		return fmt.Errorf("invalidate before replacement: %w", err)
+	var current fqdnEndpointValue
+	inPlace := s.committed && s.revision == revision && !b.isStaged(ep, "")
+	if inPlace {
+		if err := b.maps["fqdn_endpoints"].Get(fqdnUint32(ep.IfIndex), fqdnBytes(&current)); err != nil {
+			return err
+		}
+		inPlace = current.Lifetime == ep.Lifetime && current.Generation == revision && current.Flags == (fqdnEndpointSelected|fqdnEndpointReady)
+	}
+	// A policy revision must first invalidate old authority. Ordinary DNS
+	// additions under the same proven policy stay individually valid, so they
+	// need no packet-dropping readiness transition.
+	if !inPlace {
+		s.committed = false
+		if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
+			return fmt.Errorf("invalidate before replacement: %w", err)
+		}
 	}
 	if flowProofChanges(s, revision, grants) {
 		if err = b.reconcileFlows(ctx, s, revision); err != nil {
@@ -296,6 +318,9 @@ func (b *FQDNBackend) Replace(ctx context.Context, ep fqdn.Endpoint, revision ui
 		if err = ctx.Err(); err != nil {
 			return err
 		}
+		if prior, ok := s.grants[k]; ok && prior == value {
+			continue
+		}
 		if err = b.maps["fqdn_grants"].Put(fqdnBytes(&k), fqdnBytes(&value)); err != nil {
 			return fmt.Errorf("program grant: %w", err)
 		}
@@ -306,16 +331,19 @@ func (b *FQDNBackend) Replace(ctx context.Context, ep fqdn.Endpoint, revision ui
 	}
 	s.revision = revision
 	s.observations = append([]fqdn.Grant(nil), grants...)
-	if !b.staging {
+	if !b.isStaged(ep, "") {
 		v.Flags |= fqdnEndpointReady
 	}
-	if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
-		return fmt.Errorf("activate grants: %w", err)
+	if !inPlace {
+		if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
+			return fmt.Errorf("activate grants: %w", err)
+		}
 	}
+	s.committed = true
 	return nil
 }
 func (b *FQDNBackend) Check(ctx context.Context, ep fqdn.Endpoint, revision uint64, grants []fqdn.Grant) error {
-	if b.staging {
+	if b.isStaged(ep, "") {
 		return errors.New("FQDN shared policy update in progress")
 	}
 	s, err := b.binding(ep)
@@ -385,6 +413,10 @@ func (b *FQDNBackend) Delete(ctx context.Context, ep fqdn.Endpoint) error {
 	if err != nil {
 		return b.deleteRetiredLifetime(ctx, ep)
 	}
+	if err := b.rememberSelection(ep, false); err != nil {
+		return err
+	}
+	s.committed = false
 	v := fqdnEndpointValue{Lifetime: ep.Lifetime, Generation: s.revision, Address: fqdnAddress(ep.IP), Family: fqdnFamily(ep.IP), Flags: fqdnEndpointSelected}
 	if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
 		return fmt.Errorf("revoke endpoint lifetime: %w", err)

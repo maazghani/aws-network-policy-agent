@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
@@ -296,17 +297,22 @@ func installDNSSteering(family int, mark uint32, table, priority int) (*dnsSteer
 	if err := installDNSForwardGuard(family, mark); err != nil {
 		return nil, err
 	}
+	handle, err := newDNSRouteHandle()
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
 	af, network := unix.AF_INET, "0.0.0.0/0"
 	if family == 6 {
 		af, network = unix.AF_INET6, "::/0"
 	}
-	lo, err := netlink.LinkByName("lo")
+	lo, err := handle.LinkByName("lo")
 	if err != nil {
 		return nil, err
 	}
 	_, destination, _ := net.ParseCIDR(network)
 	route := &netlink.Route{LinkIndex: lo.Attrs().Index, Dst: destination, Scope: netlink.SCOPE_HOST, Table: table, Type: unix.RTN_LOCAL, Protocol: dnsRouteProtocol, Family: af}
-	routes, err := netlink.RouteListFiltered(af, &netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
+	routes, err := handle.RouteListFiltered(af, &netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +327,7 @@ func installDNSSteering(family int, mark uint32, table, priority int) (*dnsSteer
 	rule.Family, rule.Mark, rule.Table, rule.Priority, rule.Protocol = af, mark, table, priority, dnsRouteProtocol
 	mask := mark
 	rule.Mask = &mask
-	rules, err := netlink.RuleList(af)
+	rules, err := handle.RuleList(af)
 	if err != nil {
 		return nil, err
 	}
@@ -338,14 +344,14 @@ func installDNSSteering(family int, mark uint32, table, priority int) (*dnsSteer
 	// A local route alone cannot bypass DNS classification. Install it before
 	// the rule, and publish BPF readiness only after both listeners exist.
 	if !existingRoute {
-		if err := netlink.RouteAdd(route); err != nil {
+		if err := handle.RouteAdd(route); err != nil {
 			return nil, err
 		}
 	}
 	if !existingRule {
-		if err := netlink.RuleAdd(rule); err != nil {
+		if err := handle.RuleAdd(rule); err != nil {
 			if !existingRoute {
-				_ = netlink.RouteDel(route)
+				_ = handle.RouteDel(route)
 			}
 			return nil, err
 		}
@@ -353,10 +359,10 @@ func installDNSSteering(family int, mark uint32, table, priority int) (*dnsSteer
 	filter, err := installDNSNoTrack(family, mark)
 	if err != nil {
 		if !existingRule {
-			_ = netlink.RuleDel(rule)
+			_ = handle.RuleDel(rule)
 		}
 		if !existingRoute {
-			_ = netlink.RouteDel(route)
+			_ = handle.RouteDel(route)
 		}
 		return nil, err
 	}
@@ -367,5 +373,22 @@ func (s *dnsSteering) close() error {
 	if s == nil {
 		return nil
 	}
-	return errors.Join(netlink.RuleDel(s.rule), netlink.RouteDel(s.route), s.filter.close())
+	handle, err := newDNSRouteHandle()
+	if err != nil {
+		return errors.Join(err, s.filter.close())
+	}
+	defer handle.Close()
+	return errors.Join(handle.RuleDel(s.rule), handle.RouteDel(s.route), s.filter.close())
+}
+
+func newDNSRouteHandle() (*netlink.Handle, error) {
+	handle, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	if err != nil {
+		return nil, err
+	}
+	if err = handle.SetSocketTimeout(2 * time.Second); err != nil {
+		handle.Close()
+		return nil, err
+	}
+	return handle, nil
 }

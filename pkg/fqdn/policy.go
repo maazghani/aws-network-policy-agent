@@ -9,6 +9,9 @@ import (
 // NormalizeName implements the ANP ASCII domain grammar, including an optional
 // leading wildcard. A wildcard matches descendant labels and excludes the apex.
 func NormalizeName(name string) (string, error) {
+	if len(name) > 256 {
+		return "", fmt.Errorf("%w: domain exceeds maximum DNS length", ErrPolicy)
+	}
 	for i := range name {
 		if name[i] >= 128 {
 			return "", fmt.Errorf("%w: non-ASCII domain", ErrPolicy)

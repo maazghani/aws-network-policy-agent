@@ -24,6 +24,7 @@ type fqdnControllerBackend struct {
 	failReplace bool
 	ifIndex     uint32
 	stages      map[string][]string
+	forgotten   []fqdn.Endpoint
 }
 
 func (b *fqdnControllerBackend) WithFence(ctx context.Context, fn func(context.Context) error) error {
@@ -51,6 +52,11 @@ func (b *fqdnControllerBackend) Check(context.Context, fqdn.Endpoint, uint64, []
 }
 func (b *fqdnControllerBackend) Delete(context.Context, fqdn.Endpoint) error {
 	b.events = append(b.events, "delete")
+	return nil
+}
+
+func (b *fqdnControllerBackend) ForgetFQDNSelection(_ context.Context, ep fqdn.Endpoint) error {
+	b.forgotten = append(b.forgotten, ep)
 	return nil
 }
 func (b *fqdnControllerBackend) ResolveFQDNEndpoint(_ context.Context, pod *corev1.Pod, identifier string) (fqdn.Endpoint, error) {
@@ -138,7 +144,7 @@ func TestFQDNControllerFailedTransactionCannotBeReopenedByAnotherPolicy(t *testi
 func TestFQDNControllerDeletionAndReusedIdentityDoNotRetainLifetime(t *testing.T) {
 	pod := fqdnTestPod("worker-abc-1", "10.0.0.1")
 	pe := fqdnTestPE("p-0", "p", pod, "api.example.com")
-	h, _, k8sClient := newFQDNControllerTest(t, pod, &pe)
+	h, backend, k8sClient := newFQDNControllerTest(t, pod, &pe)
 	ctx := context.Background()
 	require.NoError(t, h.apply(ctx, "tenant", "pe/p-0", func() error { return nil }))
 	name := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
@@ -150,6 +156,7 @@ func TestFQDNControllerDeletionAndReusedIdentityDoNotRetainLifetime(t *testing.T
 	require.NoError(t, err)
 	_, ok := h.engine.Lookup(before.IfIndex, before.IP)
 	require.False(t, ok)
+	require.Equal(t, []fqdn.Endpoint{before}, backend.forgotten)
 	pod.ResourceVersion = ""
 	pod.UID = "replacement-uid"
 	require.NoError(t, k8sClient.Create(ctx, pod))
@@ -238,4 +245,5 @@ func TestFQDNControllerRecreatedVethGetsNewLifetime(t *testing.T) {
 	require.NotEqual(t, before.Lifetime, after.Lifetime)
 	_, oldAlive := h.engine.Lookup(before.IfIndex, before.IP)
 	require.False(t, oldAlive)
+	require.Empty(t, backend.forgotten, "same-UID veth repair must retain selection")
 }

@@ -17,12 +17,18 @@ import (
 type dnsTestBridge struct {
 	endpoint Endpoint
 	err      error
+	ready    func(context.Context) error
 }
 
 func (b *dnsTestBridge) LookupDNSIdentity(context.Context, netip.AddrPort, netip.AddrPort, uint8) (Endpoint, error) {
 	return b.endpoint, b.err
 }
-func (b *dnsTestBridge) SetProxyReady(context.Context, uint32, uint32, bool) error { return nil }
+func (b *dnsTestBridge) SetProxyReady(ctx context.Context, _ uint32, _ uint32, _ bool) error {
+	if b.ready != nil {
+		return b.ready(ctx)
+	}
+	return nil
+}
 
 func dnsProxyFixture(t *testing.T) (*Proxy, *testBackend, Endpoint) {
 	t.Helper()
@@ -112,6 +118,25 @@ func TestDNSProxyWireAndConcurrencyBounds(t *testing.T) {
 	stats := p.Stats()
 	if stats.Pending != 0 || stats.PendingBytes != 0 || stats.CapacityFailures != 2 {
 		t.Fatalf("bad reservation accounting %+v", stats)
+	}
+}
+
+func TestDNSProxyDiagnosticsDoNotWaitForHostPlumbing(t *testing.T) {
+	p, _, _ := dnsProxyFixture(t)
+	p.mu.Lock()
+	done := make(chan struct{})
+	go func() { _ = p.Stats(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		p.mu.Unlock()
+		t.Fatal("metrics blocked behind lifecycle plumbing")
+	}
+	p.mu.Unlock()
+	p.config.ExchangeTimeout = 5 * time.Millisecond
+	p.bridge.(*dnsTestBridge).ready = func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
+	if err := p.Start(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("startup readiness publication was not bounded: %v", err)
 	}
 }
 

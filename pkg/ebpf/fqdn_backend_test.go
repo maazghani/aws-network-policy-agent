@@ -319,3 +319,106 @@ func TestFQDNFenceContextCannotBypassAfterPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFQDNScopedFailedStagePreservesUnrelatedEndpoint(t *testing.T) {
+	b, ep := fqdnTestBackend()
+	ctx := context.Background()
+	other := ep
+	other.PodIdentifier = "unrelated"
+	other.Namespace = "other"
+	other.IfIndex++
+	other.Lifetime++
+	b.bound[other.IfIndex] = &fqdnBinding{endpoint: other, grants: map[fqdnGrantKey]fqdnGrantValue{}, flowNames: map[fqdnFlowKey][]string{}}
+	for _, endpoint := range []fqdn.Endpoint{ep, other} {
+		if err := b.Replace(ctx, endpoint, 1, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.BeginFQDNPolicyUpdateFor(ctx, "failed", []string{ep.PodIdentifier}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EndFQDNPolicyUpdateFor(ctx, "failed", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Check(ctx, other, 1, nil); err != nil {
+		t.Fatal("unrelated endpoint lost permission", err)
+	}
+	if err := b.BeginFQDNPolicyUpdateFor(ctx, "other", []string{other.PodIdentifier}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EndFQDNPolicyUpdateFor(ctx, "other", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Check(ctx, ep, 1, nil); err == nil {
+		t.Fatal("unrelated success reopened failed transaction")
+	}
+	if err := b.Check(ctx, other, 1, nil); err != nil {
+		t.Fatal("unrelated success cannot recover independently", err)
+	}
+}
+func TestFQDNStageCannotReactivateUncommittedOrphan(t *testing.T) {
+	b, ep := fqdnTestBackend()
+	ctx := context.Background()
+	if err := b.BeginFQDNPolicyUpdate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EndFQDNPolicyUpdate(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Check(ctx, ep, 0, nil); err == nil {
+		t.Fatal("orphan bind became ready without committed policy")
+	}
+}
+func TestFQDNSameRevisionAnswersDoNotDropEstablishedTraffic(t *testing.T) {
+	b, ep := fqdnTestBackend()
+	ctx := context.Background()
+	g := fqdnTestGrant()
+	if err := b.Replace(ctx, ep, 1, []fqdn.Grant{g}); err != nil {
+		t.Fatal(err)
+	}
+	// No readiness write is needed for a duplicate or valid same-policy addition.
+	b.maps["fqdn_endpoints"].(*fqdnTestMap).failPut = true
+	if err := b.Replace(ctx, ep, 1, []fqdn.Grant{g}); err != nil {
+		t.Fatal("duplicate answer toggled readiness", err)
+	}
+	g.Deadline++
+	if err := b.Replace(ctx, ep, 1, []fqdn.Grant{g}); err != nil {
+		t.Fatal("same-policy learning toggled readiness", err)
+	}
+	if err := b.Check(ctx, ep, 1, []fqdn.Grant{g}); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestFQDNSelectedVethReplacementStaysRestrictive(t *testing.T) {
+	b, ep := fqdnTestBackend()
+	ctx := context.Background()
+	if err := b.Replace(ctx, ep, 1, []fqdn.Grant{fqdnTestGrant()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete(ctx, ep); err != nil {
+		t.Fatal(err)
+	}
+	selected := b.selections[ep.Namespace+"/"+ep.Name]
+	newIndex := ep.IfIndex + 10
+	if err := b.preserveSelectedInterface(newIndex, selected); err != nil {
+		t.Fatal(err)
+	}
+	var v fqdnEndpointValue
+	if err := b.maps["fqdn_endpoints"].Get(fqdnUint32(newIndex), fqdnBytes(&v)); err != nil {
+		t.Fatal(err)
+	}
+	if v.Flags != fqdnEndpointSelected || v.Generation != 0 {
+		t.Fatal("replacement became unselected or retained grant generation", v)
+	}
+	successor := ep
+	successor.Lifetime++
+	if err := b.rememberSelection(successor, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ForgetFQDNSelection(ctx, ep); err != nil {
+		t.Fatal(err)
+	}
+	if b.selections[ep.Namespace+"/"+ep.Name] != successor {
+		t.Fatal("forgetting old pod erased successor selection")
+	}
+}

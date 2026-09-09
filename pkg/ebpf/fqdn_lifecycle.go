@@ -50,46 +50,27 @@ func (b *FQDNBackend) invalidateLegacyConntrack(ep fqdn.Endpoint) error {
 	return nil
 }
 func (b *FQDNBackend) BeginFQDNPolicyUpdate(ctx context.Context) error {
-	return b.WithFence(ctx, func(context.Context) error {
-		b.staging = true
-		var result error
-		for _, s := range b.bound {
-			v := fqdnEndpointValue{Lifetime: s.endpoint.Lifetime, Generation: s.revision, Address: fqdnAddress(s.endpoint.IP), Family: fqdnFamily(s.endpoint.IP), Flags: fqdnEndpointSelected}
-			result = errors.Join(result, b.maps["fqdn_endpoints"].Put(fqdnUint32(s.endpoint.IfIndex), fqdnBytes(&v)))
-		}
-		return result
-	})
+	return b.BeginFQDNPolicyUpdateFor(ctx, "global", []string{"*"})
 }
 func (b *FQDNBackend) EndFQDNPolicyUpdate(ctx context.Context, success bool) error {
-	return b.WithFence(ctx, func(ctx context.Context) error {
-		if !success {
-			return nil
-		}
-		// Validate every endpoint and all dependent established flows before making
-		// any selected endpoint ready after a shared Admin/namespace update.
-		for _, s := range b.bound {
-			if err := b.verify(ctx, s.endpoint); err != nil {
-				return err
-			}
-			if err := b.reconcileFlows(ctx, s, s.revision); err != nil {
-				return err
-			}
-		}
-		for _, s := range b.bound {
-			v := fqdnEndpointValue{Lifetime: s.endpoint.Lifetime, Generation: s.revision, Address: fqdnAddress(s.endpoint.IP), Family: fqdnFamily(s.endpoint.IP), Flags: fqdnEndpointSelected | fqdnEndpointReady}
-			if err := b.maps["fqdn_endpoints"].Put(fqdnUint32(s.endpoint.IfIndex), fqdnBytes(&v)); err != nil {
-				return fmt.Errorf("complete FQDN policy stage: %w", err)
-			}
-		}
-		b.staging = false
-		return nil
-	})
+	return b.EndFQDNPolicyUpdateFor(ctx, "global", success)
 }
 
-// releaseInactiveInterface is called only after a successful CNI attachment.
-// A tombstone with no live userspace binding belongs to a retired lifetime;
-// this verified new attachment can restore the ordinary unselected path.
-func (b *FQDNBackend) releaseInactiveInterface(name string) error {
+func (b *FQDNBackend) isStaged(ep fqdn.Endpoint, except string) bool {
+	for transaction, ids := range b.stages {
+		if transaction != except && (ids["*"] || ids[ep.PodIdentifier]) {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareInterfaceSelection runs before either TC hook is installed on the
+// resolved CNI interface.
+// A previously selected pod name remains restrictive across CNI veth repair,
+// including a lost DEL and ifindex change. A genuinely unrelated unselected pod
+// can reclaim a reused interface only after no selected lifetime names it.
+func (b *FQDNBackend) prepareInterfaceSelection(name, namespace, podName string) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
 		return err
@@ -97,6 +78,12 @@ func (b *FQDNBackend) releaseInactiveInterface(name string) error {
 	index := uint32(link.Attrs().Index)
 	if b.bound[index] != nil {
 		return nil
+	}
+	b.selectionMu.Lock()
+	selected, wasSelected := b.selections[namespace+"/"+podName]
+	b.selectionMu.Unlock()
+	if wasSelected {
+		return b.preserveSelectedInterface(index, selected)
 	}
 	err = b.maps["fqdn_endpoints"].Delete(fqdnUint32(index))
 	if errors.Is(err, unix.ENOENT) {
@@ -299,9 +286,107 @@ func (b *FQDNBackend) deleteRetiredLifetime(ctx context.Context, ep fqdn.Endpoin
 	return ctx.Err()
 }
 
+// Stages retain failed transaction scopes independently. An unrelated namespace
+// can recover without reopening any shared map involved in an unfinished update.
 func (b *FQDNBackend) BeginFQDNPolicyUpdateFor(ctx context.Context, transaction string, podIdentifiers []string) error {
-	return b.BeginFQDNPolicyUpdate(ctx)
+	return b.WithFence(ctx, func(ctx context.Context) error {
+		if transaction == "" {
+			return errors.New("FQDN policy transaction identity required")
+		}
+		if b.stages == nil {
+			b.stages = map[string]map[string]bool{}
+		}
+		scope := b.stages[transaction]
+		if scope == nil {
+			scope = map[string]bool{}
+		}
+		for _, id := range podIdentifiers {
+			scope[id] = true
+		}
+		capacity := len(b.stages) >= 4096 && b.stages[transaction] == nil
+		if !capacity {
+			b.stages[transaction] = scope
+		}
+		var result error
+		for _, s := range b.bound {
+			if !scope["*"] && !scope[s.endpoint.PodIdentifier] {
+				continue
+			}
+			if capacity {
+				s.committed = false
+			}
+			v := fqdnEndpointValue{Lifetime: s.endpoint.Lifetime, Generation: s.revision, Address: fqdnAddress(s.endpoint.IP), Family: fqdnFamily(s.endpoint.IP), Flags: fqdnEndpointSelected}
+			result = errors.Join(result, b.maps["fqdn_endpoints"].Put(fqdnUint32(s.endpoint.IfIndex), fqdnBytes(&v)))
+		}
+		if capacity {
+			result = errors.Join(result, fqdn.ErrCapacity)
+		}
+		return result
+	})
 }
 func (b *FQDNBackend) EndFQDNPolicyUpdateFor(ctx context.Context, transaction string, success bool) error {
-	return b.EndFQDNPolicyUpdate(ctx, success)
+	return b.WithFence(ctx, func(ctx context.Context) error {
+		if !success {
+			return nil
+		}
+		scope, exists := b.stages[transaction]
+		if !exists {
+			return errors.New("FQDN policy transaction not started")
+		}
+		candidates := []*fqdnBinding{}
+		for _, s := range b.bound {
+			if (!scope["*"] && !scope[s.endpoint.PodIdentifier]) || b.isStaged(s.endpoint, transaction) || !s.committed {
+				continue
+			}
+			if err := b.verify(ctx, s.endpoint); err != nil {
+				return err
+			}
+			if err := b.reconcileFlows(ctx, s, s.revision); err != nil {
+				return err
+			}
+			candidates = append(candidates, s)
+		}
+		for _, s := range candidates {
+			v := fqdnEndpointValue{Lifetime: s.endpoint.Lifetime, Generation: s.revision, Address: fqdnAddress(s.endpoint.IP), Family: fqdnFamily(s.endpoint.IP), Flags: fqdnEndpointSelected | fqdnEndpointReady}
+			if err := b.maps["fqdn_endpoints"].Put(fqdnUint32(s.endpoint.IfIndex), fqdnBytes(&v)); err != nil {
+				return fmt.Errorf("complete FQDN policy stage: %w", err)
+			}
+		}
+		delete(b.stages, transaction)
+		return nil
+	})
+}
+
+func (b *FQDNBackend) rememberSelection(ep fqdn.Endpoint, replace bool) error {
+	b.selectionMu.Lock()
+	defer b.selectionMu.Unlock()
+	if b.selections == nil {
+		b.selections = map[string]fqdn.Endpoint{}
+	}
+	key := ep.Namespace + "/" + ep.Name
+	previous, exists := b.selections[key]
+	if !exists && len(b.selections) >= 4096 {
+		return fmt.Errorf("FQDN retained selected lifetimes: %w", fqdn.ErrCapacity)
+	}
+	if !exists || replace || previous.Lifetime == ep.Lifetime {
+		b.selections[key] = ep
+	}
+	return nil
+}
+func (b *FQDNBackend) preserveSelectedInterface(index uint32, previous fqdn.Endpoint) error {
+	v := fqdnEndpointValue{Lifetime: previous.Lifetime, Address: fqdnAddress(previous.IP), Family: fqdnFamily(previous.IP), Flags: fqdnEndpointSelected}
+	return b.maps["fqdn_endpoints"].Put(fqdnUint32(index), fqdnBytes(&v))
+}
+
+// ForgetFQDNSelection is called only after the controller proves the old pod is
+// absent or replaced by another UID. It does not remove a kernel tombstone and
+// cannot overwrite a successor. The mutex protects only bounded local memory.
+func (b *FQDNBackend) ForgetFQDNSelection(_ context.Context, ep fqdn.Endpoint) error {
+	b.selectionMu.Lock()
+	defer b.selectionMu.Unlock()
+	key := ep.Namespace + "/" + ep.Name
+	if prior, ok := b.selections[key]; ok && prior.Lifetime == ep.Lifetime {
+		delete(b.selections, key)
+	}
+	return nil
 }

@@ -16,6 +16,32 @@ struct fqdn_packet {
     __u8 essential_icmp;
 };
 
+/* At most 32 TLVs per extension header. Reject mobile IPv6 home-address
+ * rewriting and jumbograms: neither may change the identity after TC.
+ */
+static __noinline int fqdn_ipv6_options(void *header, void *end, __u32 length)
+{
+    __u32 offset = 2;
+    for (int n = 0; n < 32; n++) {
+        if (offset >= length)
+            return 0;
+        __u8 *option = header + offset;
+        if (option + 1 > (__u8 *)end)
+            return -1;
+        if (option[0] == 0) { /* Pad1 */
+            offset++;
+            continue;
+        }
+        if (option[0] == 201 || option[0] == 194 || option + 2 > (__u8 *)end)
+            return -1;
+        __u32 size = (__u32)option[1] + 2;
+        if (size > length - offset)
+            return -1;
+        offset += size;
+    }
+    return offset == length ? 0 : -1;
+}
+
 /* Strict parsing is used only for enrolled endpoints. Fragmented IP is rejected
  * before legacy conntrack; neither a non-initial fragment nor IPv4 options may
  * hide port 53. At most six IPv6 extension headers are accepted. ICMPv6 errors
@@ -92,7 +118,9 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
             if ((void *)(ext + 1) > end || transport_len < 2)
                 return -1;
             __u32 length = next == 51 ? ((__u32)ext->hdrlen + 2) * 4 : ((__u32)ext->hdrlen + 1) * 8;
-            if (length > transport_len || length < 8 || l4 + length > end)
+            if (length > transport_len || length < 8 || l4 + length > end || (next == 51 && length < 12))
+                return -1;
+            if (next != 51 && fqdn_ipv6_options(l4, end, length))
                 return -1;
             next = ext->nexthdr;
             l4 += length;
@@ -106,9 +134,21 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
             if ((void *)(icmp + 1) > end || transport_len < sizeof(*icmp))
                 return -1;
             __u8 type = icmp->icmp6_type;
-            p->essential_icmp = type >= 1 && type <= 4;
-            if (type >= 133 && type <= 136 && ip->hop_limit == 255)
+            __u8 code = icmp->icmp6_code;
+            if (type >= 1 && type <= 4) {
+                /* Error messages must contain the invoking IPv6 header. */
+                if (transport_len < sizeof(*icmp) + sizeof(*ip) ||
+                    (type == 1 && code > 7) || (type == 2 && code != 0) ||
+                    (type == 3 && code > 1) || (type == 4 && code > 3))
+                    return -1;
                 p->essential_icmp = 1;
+            }
+            if (type >= 133 && type <= 136) {
+                __u32 minimum = type == 133 ? 8 : type == 134 ? 16 : 24;
+                if (ip->hop_limit != 255 || code || transport_len < minimum)
+                    return -1;
+                p->essential_icmp = 2;
+            }
         }
     } else {
         return 1; /* ARP/non-IP: existing behavior. */

@@ -90,6 +90,7 @@ func TestKernelEnforcement(t *testing.T) {
 			t.Fatalf("spoofed source admitted: %d", got)
 		}
 	})
+	t.Run("parser and PMTU", func(t *testing.T) { f.parserChecks(t) })
 	t.Run("socket steering and ingress isolation", func(t *testing.T) { f.steering(t) })
 	t.Run("CoreDNS Service DNAT and existing UDP conntrack", func(t *testing.T) {
 		backend := f.resolver

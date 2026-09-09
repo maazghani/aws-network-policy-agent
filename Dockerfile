@@ -51,6 +51,8 @@ FROM ${base_image}
 
 WORKDIR /
 COPY --from=bpfbuilder /fqdn-rootfs/ /
+RUN ["/usr/sbin/iptables", "--version"]
+RUN ["/usr/sbin/ip6tables", "--version"]
 COPY --from=builder /workspace/controller .
 COPY --from=builder /workspace/aws-eks-na-cli .
 COPY --from=builder /workspace/aws-eks-na-cli-v6 .

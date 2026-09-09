@@ -63,7 +63,9 @@ func (cfg FQDNConfig) Validate(networkPolicy bool) error {
 		"observations-per-endpoint": cfg.MaxObservationsPerEndpoint,
 		"addresses-per-endpoint":    cfg.MaxAddressesPerEndpoint,
 		"grants-per-address":        cfg.MaxGrantsPerAddress, "total-grants": cfg.MaxTotalGrants,
-		"pending": cfg.MaxPending, "tcp-sockets": cfg.MaxTCPSockets,
+		"grants-per-endpoint": cfg.MaxGrantsPerEndpoint,
+		"total-observations":  cfg.MaxTotalObservations,
+		"pending":             cfg.MaxPending, "tcp-sockets": cfg.MaxTCPSockets,
 	} {
 		if value <= 0 {
 			return fmt.Errorf("fqdn-max-%s must be explicitly configured and positive", name)
