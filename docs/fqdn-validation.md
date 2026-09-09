@@ -60,6 +60,30 @@ binding the local resolver's already occupied port 53.
 Transport echo measurements report a baseline-relative smoke result. Forty samples
 do not establish a production p99 budget.
 
+## Recorded CI evidence
+
+These runs used the workflow's Ubuntu 24.04 hosted amd64 runner on 2026-09-09.
+The environment and synthetic packet captures are retained in the run artifacts.
+Failures are recorded alongside passing assertions; none of these results is an
+EKS compatibility or production performance qualification.
+
+| Commit / raw run | Observed result |
+| --- | --- |
+| [`ac9aa7e3`](https://github.com/maazghani/aws-network-policy-agent/actions/runs/34320508173) | IPv4 verifier, packet/parser checks and direct/Service-VIP UDP passed. TCP handshakes connected but data timed out; IPv6 was not reached by that version of the runner. |
+| [`06d2357b`](https://github.com/maazghani/aws-network-policy-agent/actions/runs/34321257076) | IPv4 production UDP publication-barrier cases passed for Service VIP and NodeLocal, including delayed/failed writes, attachment loss and deletion. TCP reset before accept; IPv6 hit the verifier's explored-instruction limit. The overall run failed. |
+| [`dc73052c`](https://github.com/maazghani/aws-network-policy-agent/actions/runs/34322074818) | Entire IPv4 suite passed. Both families' programs loaded and real UDP/TCP steering, original tuples, persistent DNS/TCP fallback, NodeLocal, route reconciliation, publication barriers and TCP lifetime/revocation assertions passed. The overall run failed because the kernel's page-sized `BPF_PROG_TEST_RUN` input allocation rejected the 12 KB synthetic IPv6 extension packet with `EINVAL` before a verdict. |
+
+The third run's socket tests verified 40 sequential exchanges per transport for
+each direct and Service-VIP resolver path in each family. Its positive-response
+checks required both responses on each persistent TCP connection. This is
+feasibility evidence with controlled fixtures; sustained concurrency, production
+load, fleet recovery and the release matrix below remain unqualified. The corrected
+parser fixtures exercise one 2048-byte extension header and a chain of six
+512-byte headers; the maximum combined 12 KB chain still needs a real jumbo-MTU
+packet test rather than the size-limited syscall fixture.
+
+## Userspace measurements
+
 Local userspace microbenchmarks are reproducible without kernel privileges:
 
 ```sh
@@ -95,7 +119,7 @@ must be measured separately during the load/recovery matrix.
 | --- | --- | --- |
 | Controller compilation and named ports | Controller regression tests and companion controller patch | Deploy patched/schema-compatible controller; verify numeric, range, omitted and rejected named-port behavior on EKS |
 | Endpoint-specific grants and policy tiers | Real TC packet tests plus backend/state tests | Full overlapping-policy churn, established TCP and both-direction Admin revocation under concurrent real traffic |
-| DNS steering feasibility | Isolated veth, transparent sockets, both families and Service DNAT tests | Successful privileged job output; NodeLocal, Route 53, resolver ACL/view and host-firewall matrix |
+| DNS steering feasibility | Isolated veth, transparent sockets, both families and Service DNAT tests; raw CI evidence above | Fully green privileged job; EKS NodeLocal, Route 53, resolver ACL/view and host-firewall matrix |
 | Positive-response barrier | Production proxy/engine/backend kernel harness with injected delay, write failure, detach and deletion | Sustained concurrent publication/static-policy churn, deletion at every boundary and load saturation |
 | Parsing, TTL and bounded state | Parser/state tests, fuzz seeds and microbenchmarks | Extended fuzz runs; GC-stopped kernel expiry/load; capacity defaults measured on candidate nodes |
 | Lifecycle and recovery | Generation/lifetime packet tests and agent/backend lifecycle tests | Lost deletion, real IP/ifindex reuse, process restart and node upgrade/rollback workload runs |

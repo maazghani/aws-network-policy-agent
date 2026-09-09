@@ -133,18 +133,31 @@ func (f *fixture) parserChecks(t *testing.T) {
 		}
 		run(name, extension(60, header), want)
 	}
-	maximumChain := make([]byte, 6*2048)
-	for i := 0; i < 6; i++ {
-		header := maximumChain[i*2048 : (i+1)*2048]
-		header[0], header[1] = 60, 255
-		for offset := 2; offset < len(header); {
-			size := min(257, len(header)-offset)
-			header[offset], header[offset+1] = 1, byte(size-2)
-			offset += size
+	// skb BPF_PROG_TEST_RUN rejects input beyond its page-sized allocation.
+	// Linux v6.8 net/bpf/test_run.c:bpf_test_init limits input to PAGE_SIZE
+	// minus the headroom and tailroom supplied by bpf_prog_test_run_skb.
+	// https://github.com/torvalds/linux/blob/v6.8/net/bpf/test_run.c#L636-L646
+	// Exercise the maximum header length and six-header traversal separately.
+	for _, test := range []struct {
+		name          string
+		count, length int
+	}{
+		{"IPv6 maximum length extension", 1, 2048},
+		{"IPv6 six long extensions", 6, 512},
+	} {
+		chain := make([]byte, test.count*test.length)
+		for i := 0; i < test.count; i++ {
+			header := chain[i*test.length : (i+1)*test.length]
+			header[0], header[1] = 60, byte(test.length/8-1)
+			for offset := 2; offset < len(header); {
+				size := min(257, len(header)-offset)
+				header[offset], header[offset+1] = 1, byte(size-2)
+				offset += size
+			}
 		}
+		chain[(test.count-1)*test.length] = 17
+		run(test.name, build(60, append(chain, udp...)), 0)
 	}
-	maximumChain[5*2048] = 17
-	run("IPv6 six maximum length extensions", build(60, append(maximumChain, udp...)), 0)
 	p := build(17, udp)
 	binary.BigEndian.PutUint16(p[18:], 0)
 	run("IPv6 unsupported jumbogram", p, 2)
