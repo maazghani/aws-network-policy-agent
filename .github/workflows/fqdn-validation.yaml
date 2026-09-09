@@ -37,6 +37,12 @@ jobs:
         run: |
           set -o pipefail
           sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOPATH=$(go env GOPATH)" ./scripts/fqdn-kernel-tests.sh 2>&1 | tee test-results/kernel.txt
+      - name: Restore runner ownership of shared Go caches
+        if: always()
+        run: |
+          # The privileged test build shares this disposable runner's caches.
+          # Return new root-owned entries before unprivileged race tests/cache save.
+          sudo chown -R "$(id -u):$(id -g)" "$(go env GOCACHE)" "$(go env GOPATH)/pkg/mod"
       - name: Unit tests and parser fuzz seeds
         run: |
           set -o pipefail
