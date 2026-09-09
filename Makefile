@@ -98,8 +98,11 @@ build: manifests generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./main.go
 
+GO_ARCH ?= $(shell go env GOARCH)
+CGO_ENABLED ?= 1
+
 GO_ENV_EBPF =
-GO_ENV_EBPF += CGO_ENABLED=1
+GO_ENV_EBPF += CGO_ENABLED=$(CGO_ENABLED)
 GO_ENV_EBPF += GOOS=linux
 GO_ENV_EBPF += GOARCH=$(GO_ARCH)
 GO_ENV_EBPF += CGO_CFLAGS=$(CUSTOM_CGO_CFLAGS)
@@ -121,8 +124,8 @@ BUILD_MODE ?= -buildmode=pie
 build-linux: BUILD_FLAGS = $(BUILD_MODE) -ldflags '-s -w $(LDFLAGS) $(VERSION_LDFLAGS) -extldflags "-static"'
 build-linux: ## Build the controllerusing the host's Go toolchain.
 	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -a -o controller main.go
-	go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -o aws-eks-na-cli ./cmd/cli
-	go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -o aws-eks-na-cli-v6 ./cmd/cliv6
+	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -o aws-eks-na-cli ./cmd/cli
+	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -o aws-eks-na-cli-v6 ./cmd/cliv6
 
 
 CMD_MKDIR ?= mkdir

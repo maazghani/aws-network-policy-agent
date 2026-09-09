@@ -129,7 +129,7 @@ func serveDNSOrEchoTCP(conn net.Conn) {
 
 type dnsResult struct {
 	Positive                  bool
-	RCode, Answers            int
+	RCode, Answers, Responses int
 	ElapsedNS, ReceivedUnixNS int64
 	Error                     string
 	Truncated                 bool
@@ -233,6 +233,7 @@ func probeDNS() int {
 			return 0
 		}
 		result.ReceivedUnixNS = time.Now().UnixNano()
+		result.Responses++
 		result.ElapsedNS = time.Since(start).Nanoseconds()
 		result.RCode = int(response[3] & 15)
 		result.Answers = int(binary.BigEndian.Uint16(response[6:]))
@@ -355,7 +356,11 @@ func (f *fixture) fullProxy(t *testing.T) {
 	checkPositive := func(t *testing.T, network, name string) {
 		t.Helper()
 		result := f.dns(network+fmt.Sprint(f.family), name)
-		if !result.Positive {
+		wantResponses := 1
+		if network == "tcp" {
+			wantResponses = 2
+		}
+		if !result.Positive || result.Error != "" || result.Responses != wantResponses {
 			t.Fatalf("expected positive %s %s: %+v", network, name, result)
 		}
 		if result.ReceivedUnixNS < faults.committed.Load() {
@@ -367,6 +372,27 @@ func (f *fixture) fullProxy(t *testing.T) {
 	}
 	checkPositive(t, "udp", "allowed.test")
 	checkPositive(t, "udp", "allowed.test")
+	// Repeated reconciliation must recognize the exact rules created by Start,
+	// including the kernel's canonical iptables representation.
+	for i := 0; i < 2; i++ {
+		if err := proxy.Reconcile(context.Background()); err != nil {
+			t.Fatalf("idempotent host plumbing reconciliation: %v", err)
+		}
+	}
+	checkPositive(t, "udp", "allowed.test")
+	if f.resolver != f.pod.Prev() {
+		// A non-local resolver would become directly reachable by forwarding if
+		// the owned guard did not cover loss of the local policy route.
+		f.command("ip", fmt.Sprintf("-%d", f.family), "route", "del", "local", "default", "dev", "lo", "table", fmt.Sprint(fqdn.DefaultDNSRouteTable))
+		blocked := f.dns(fmt.Sprintf("udp%d", f.family), "allowed.test")
+		if blocked.Responses != 0 {
+			t.Errorf("missing local route bypassed production proxy: %+v", blocked)
+		}
+		if err := proxy.Reconcile(context.Background()); err != nil {
+			t.Fatalf("restore missing host route: %v", err)
+		}
+		checkPositive(t, "udp", "allowed.test")
+	}
 	t.Run("persistent TCP", func(t *testing.T) { checkPositive(t, "tcp", "allowed.test") })
 	truncated := f.dns(fmt.Sprintf("udp%d", f.family), "truncated.allowed.test")
 	if !truncated.Truncated || truncated.Positive {

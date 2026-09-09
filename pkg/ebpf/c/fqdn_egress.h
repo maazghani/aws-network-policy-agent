@@ -55,79 +55,49 @@ static __noinline int fqdn_static_action(struct keystruct *trie, struct conntrac
  * policy routing delivers the marked packet locally. Missing listener, route
  * readiness, metadata capacity or sk_assign support always drops selected DNS.
  */
-static __noinline int fqdn_assign_dns(struct __sk_buff *skb, struct fqdn_endpoint *ep,
+static __always_inline void fqdn_dns_socket_tuple(struct bpf_sock_tuple *tuple,
+        struct fqdn_packet *packet)
+{
+#ifdef FQDN_IPV6
+    __builtin_memcpy(tuple->ipv6.saddr, packet->tuple.src, 16);
+    __builtin_memcpy(tuple->ipv6.daddr, packet->tuple.dst, 16);
+    tuple->ipv6.sport = bpf_htons(packet->tuple.sport);
+    tuple->ipv6.dport = bpf_htons(packet->tuple.dport);
+#else
+    __builtin_memcpy(&tuple->ipv4.saddr, packet->tuple.src, 4);
+    __builtin_memcpy(&tuple->ipv4.daddr, packet->tuple.dst, 4);
+    tuple->ipv4.sport = bpf_htons(packet->tuple.sport);
+    tuple->ipv4.dport = bpf_htons(packet->tuple.dport);
+#endif
+}
+
+static __always_inline void fqdn_dns_listener_tuple(struct bpf_sock_tuple *tuple, __u16 port)
+{
+#ifdef FQDN_IPV6
+    __builtin_memset(tuple->ipv6.daddr, 0, 16);
+    tuple->ipv6.daddr[3] = bpf_htonl(1);
+    tuple->ipv6.dport = bpf_htons(port);
+#else
+    tuple->ipv4.daddr = bpf_htonl(0x7f000001);
+    tuple->ipv4.dport = bpf_htons(port);
+#endif
+}
+
+static __always_inline int fqdn_dns_prior_syn(struct __sk_buff *skb, struct fqdn_endpoint *ep,
         struct fqdn_packet *packet, __u64 now)
 {
-    __u32 zero = 0;
-    struct fqdn_proxy_config *config = bpf_map_lookup_elem(&fqdn_proxy, &zero);
-    if (!config || !config->ready || !config->port || config->port > 65535 || !config->mark || !config->reply_mark)
-        return BPF_DROP;
-    __u32 mark = config->mark;
-    __u32 reply_mark = config->reply_mark;
-    __u16 port = config->port;
-    struct bpf_sock_tuple tuple = {};
-    struct bpf_sock *socket = 0;
-    /* The verifier requires a constant tuple size at each socket helper call.
-     * Each TC object enforces one family; do not merge runtime-sized tuples.
-     */
-#ifdef FQDN_IPV6
-    const __u32 size = sizeof(tuple.ipv6);
-    __builtin_memcpy(tuple.ipv6.saddr, packet->tuple.src, 16);
-    __builtin_memcpy(tuple.ipv6.daddr, packet->tuple.dst, 16);
-    tuple.ipv6.sport = bpf_htons(packet->tuple.sport);
-    tuple.ipv6.dport = bpf_htons(packet->tuple.dport);
-#else
-    const __u32 size = sizeof(tuple.ipv4);
-    __builtin_memcpy(&tuple.ipv4.saddr, packet->tuple.src, 4);
-    __builtin_memcpy(&tuple.ipv4.daddr, packet->tuple.dst, 4);
-    tuple.ipv4.sport = bpf_htons(packet->tuple.sport);
-    tuple.ipv4.dport = bpf_htons(packet->tuple.dport);
-#endif
-    if (packet->tuple.protocol == IPPROTO_TCP) {
-        socket = bpf_sk_lookup_tcp(skb, &tuple, size, ((__u64)-1), 0);
-        /* An established original-tuple socket could belong to NodeLocal DNS
-         * from before enrollment. Only our marked proxy listener's accepted
-         * sockets can continue a persistent intercepted connection.
-         */
-        if (socket && (socket->state == 10 /* TCP_LISTEN */ ||
-                (socket->mark & reply_mark) != reply_mark)) {
-            bpf_sk_release(socket);
-            socket = 0;
-        }
-    }
-    if (!socket) {
-        if (packet->tuple.protocol == IPPROTO_TCP && (!packet->syn || packet->ack)) {
-            /* During handshake the original tuple may resolve to a request
-             * socket, not an established full socket. Permit the third ACK to
-             * reach our marked listener only when a prior redirected SYN
-             * proves this exact tuple and live endpoint. Pre-enrollment TCP
-             * cannot acquire this provenance from legacy/Linux conntrack.
-             */
-            struct fqdn_dns_value *prior = bpf_map_lookup_elem(&fqdn_dns, &packet->tuple);
-            if (!prior || prior->lifetime != ep->lifetime || prior->ifindex != skb->ifindex || prior->deadline <= now)
-                return BPF_DROP;
-        }
-        /* Lookup the exclusively configured transparent loopback listener. */
-#ifdef FQDN_IPV6
-        __builtin_memset(tuple.ipv6.daddr, 0, 16);
-        tuple.ipv6.daddr[3] = bpf_htonl(1);
-        tuple.ipv6.dport = bpf_htons(port);
-#else
-        tuple.ipv4.daddr = bpf_htonl(0x7f000001);
-        tuple.ipv4.dport = bpf_htons(port);
-#endif
-        if (packet->tuple.protocol == IPPROTO_TCP)
-            socket = bpf_sk_lookup_tcp(skb, &tuple, size, ((__u64)-1), 0);
-        else
-            socket = bpf_sk_lookup_udp(skb, &tuple, size, ((__u64)-1), 0);
-        if (!socket)
-            return BPF_DROP;
-        if ((socket->mark & reply_mark) != reply_mark ||
-            (packet->tuple.protocol == IPPROTO_TCP && socket->state != 10)) {
-            bpf_sk_release(socket);
-            return BPF_DROP;
-        }
-    }
+    struct fqdn_dns_value *prior = bpf_map_lookup_elem(&fqdn_dns, &packet->tuple);
+    return prior && prior->lifetime == ep->lifetime && prior->generation == ep->generation &&
+        prior->ifindex == skb->ifindex && prior->deadline > now;
+}
+
+/* Keep this inlined separately into TCP and UDP. skc_lookup_tcp yields a
+ * sock_common (including request sockets), whereas sk_lookup_udp yields a full
+ * socket; merging their verifier pointer types before sk_assign is invalid.
+ */
+static __always_inline int fqdn_commit_dns_socket(struct __sk_buff *skb, struct fqdn_endpoint *ep,
+        struct fqdn_packet *packet, __u64 now, struct bpf_sock *socket, __u32 mark)
+{
     struct fqdn_dns_value identity = {.lifetime = ep->lifetime, .generation = ep->generation,
         .deadline = now + FQDN_DNS_TIMEOUT, .ifindex = skb->ifindex};
     if (!fqdn_endpoint_current(skb->ifindex, ep) ||
@@ -141,6 +111,100 @@ static __noinline int fqdn_assign_dns(struct __sk_buff *skb, struct fqdn_endpoin
         return BPF_DROP;
     skb->mark |= mark;
     return BPF_OK;
+}
+
+static __noinline int fqdn_assign_dns_tcp(struct __sk_buff *skb, struct fqdn_endpoint *ep,
+        struct fqdn_packet *packet, __u64 now)
+{
+    __u32 zero = 0;
+    struct fqdn_proxy_config *config = bpf_map_lookup_elem(&fqdn_proxy, &zero);
+    if (!config || !config->ready || !config->port || config->port > 65535 || !config->mark || !config->reply_mark)
+        return BPF_DROP;
+    __u32 mark = config->mark, reply_mark = config->reply_mark;
+    __u16 port = config->port;
+    struct bpf_sock_tuple tuple = {};
+#ifdef FQDN_IPV6
+    const __u32 size = sizeof(tuple.ipv6);
+#else
+    const __u32 size = sizeof(tuple.ipv4);
+#endif
+    fqdn_dns_socket_tuple(&tuple, packet);
+    /* sk_lookup_tcp converts TCP_NEW_SYN_RECV to its listener. Assigning that
+     * listener to the third ACK skips tcp_check_req and resets the connection.
+     * Linux's test_sk_assign.c uses skc_lookup_tcp to retain the request socket
+     * and proves that listener and original destination ports can differ.
+     */
+    struct bpf_sock *socket = bpf_skc_lookup_tcp(skb, &tuple, size, ((__u64)-1), 0);
+    if (socket) {
+        if (socket->state == 10 /* TCP_LISTEN */) {
+            bpf_sk_release(socket);
+            socket = 0;
+        } else {
+            struct bpf_sock *full = bpf_sk_fullsock(socket);
+            if (full) {
+                /* Never adopt pre-enrollment NodeLocal/other host sockets. */
+                if ((full->mark & reply_mark) != reply_mark) {
+                    bpf_sk_release(socket);
+                    return BPF_DROP;
+                }
+            } else if (!fqdn_dns_prior_syn(skb, ep, packet, now)) {
+                /* Request/TIME_WAIT sockets lack sk_mark. Only a SYN already
+                 * assigned by TC in this lifetime/generation proves ownership.
+                 */
+                bpf_sk_release(socket);
+                return BPF_DROP;
+            }
+        }
+    }
+    if (!socket) {
+        if ((!packet->syn || packet->ack) && !fqdn_dns_prior_syn(skb, ep, packet, now))
+            return BPF_DROP;
+        fqdn_dns_listener_tuple(&tuple, port);
+        socket = bpf_skc_lookup_tcp(skb, &tuple, size, ((__u64)-1), 0);
+        if (!socket)
+            return BPF_DROP;
+        struct bpf_sock *full = bpf_sk_fullsock(socket);
+        if (!full || full->state != 10 || (full->mark & reply_mark) != reply_mark) {
+            bpf_sk_release(socket);
+            return BPF_DROP;
+        }
+    }
+    return fqdn_commit_dns_socket(skb, ep, packet, now, socket, mark);
+}
+
+static __noinline int fqdn_assign_dns_udp(struct __sk_buff *skb, struct fqdn_endpoint *ep,
+        struct fqdn_packet *packet, __u64 now)
+{
+    __u32 zero = 0;
+    struct fqdn_proxy_config *config = bpf_map_lookup_elem(&fqdn_proxy, &zero);
+    if (!config || !config->ready || !config->port || config->port > 65535 || !config->mark || !config->reply_mark)
+        return BPF_DROP;
+    __u32 mark = config->mark, reply_mark = config->reply_mark;
+    __u16 port = config->port;
+    struct bpf_sock_tuple tuple = {};
+#ifdef FQDN_IPV6
+    const __u32 size = sizeof(tuple.ipv6);
+#else
+    const __u32 size = sizeof(tuple.ipv4);
+#endif
+    fqdn_dns_socket_tuple(&tuple, packet);
+    fqdn_dns_listener_tuple(&tuple, port);
+    struct bpf_sock *socket = bpf_sk_lookup_udp(skb, &tuple, size, ((__u64)-1), 0);
+    if (!socket)
+        return BPF_DROP;
+    if ((socket->mark & reply_mark) != reply_mark) {
+        bpf_sk_release(socket);
+        return BPF_DROP;
+    }
+    return fqdn_commit_dns_socket(skb, ep, packet, now, socket, mark);
+}
+
+static __always_inline int fqdn_assign_dns(struct __sk_buff *skb, struct fqdn_endpoint *ep,
+        struct fqdn_packet *packet, __u64 now)
+{
+    if (packet->tuple.protocol == IPPROTO_TCP)
+        return fqdn_assign_dns_tcp(skb, ep, packet, now);
+    return fqdn_assign_dns_udp(skb, ep, packet, now);
 }
 
 static __noinline int fqdn_static_cached(struct conntrack_key *key, __u8 state, struct fqdn_tuple *tuple)

@@ -9,7 +9,7 @@ that a particular kernel, image, resolver and networking configuration work.
 ## Reproducible kernel test
 
 On a disposable Linux host with Go matching `go.mod`, clang, libbpf headers,
-iproute2, iptables/ip6tables, bpftool, Python 3 and util-linux:
+iproute2, iptables/ip6tables, bpftool, tcpdump, Python 3 and util-linux:
 
 ```sh
 sudo env "PATH=$PATH" ./scripts/fqdn-kernel-tests.sh
@@ -30,7 +30,8 @@ creates a pod veth and a reachable resolver behind a second veth. It uses real
 It does not need Kubernetes, Cilium or AWS resources.
 
 The PR workflow `.github/workflows/fqdn-validation.yaml` runs this command and
-retains kernel, compiler, feature-probe and test output. A green Ubuntu runner
+retains kernel, compiler, feature-probe and test output, plus synthetic DNS packet
+captures from each private network namespace. A green Ubuntu runner
 qualifies that runner only. Record the workflow URL and exact commit with a result.
 
 | Test surface | Executable assertions |

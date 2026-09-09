@@ -93,6 +93,7 @@ func (f *fixture) parserChecks(t *testing.T) {
 	f.static(f.target, 17, 443)
 	run("IPv6 hop-by-hop options", extension(0, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 0)
 	run("IPv6 destination options", extension(60, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 0)
+	run("IPv6 PadN fills extension exactly", extension(60, []byte{17, 0, 1, 4, 0, 0, 0, 0}), 0)
 	run("IPv6 AH minimum header", extension(51, []byte{17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}), 0)
 	wrongPort := extension(60, []byte{17, 0, 0, 0, 0, 0, 0, 0})
 	binary.BigEndian.PutUint16(wrongPort[64:], 446)
@@ -100,6 +101,7 @@ func (f *fixture) parserChecks(t *testing.T) {
 	f.static(f.target, 254, 0)
 	run("IPv6 AH truncated header", extension(51, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 2)
 	run("IPv6 malformed option length", extension(60, []byte{17, 0, 1, 255, 0, 0, 0, 0}), 2)
+	run("IPv6 option missing length byte", extension(60, []byte{17, 0, 0, 0, 0, 0, 0, 1}), 2)
 	run("IPv6 home address rewriting", extension(60, []byte{17, 0, 201, 0, 0, 0, 0, 0}), 2)
 	run("IPv6 jumbo payload option", extension(0, []byte{17, 0, 194, 0, 0, 0, 0, 0}), 2)
 	run("IPv6 routing header", extension(43, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 2)
@@ -119,6 +121,30 @@ func (f *fixture) parserChecks(t *testing.T) {
 		}
 		run(name, build(60, append(chain, udp...)), want)
 	}
+	for _, count := range []int{32, 33} {
+		header := make([]byte, 40)
+		header[0], header[1] = 17, 4
+		// All but the last option are Pad1; a final PadN fills the header.
+		last := 2 + count - 1
+		header[last], header[last+1] = 1, byte(len(header)-last-2)
+		want, name := uint32(0), "IPv6 32 option bound permits complete header"
+		if count == 33 {
+			want, name = 2, "IPv6 option traversal bound"
+		}
+		run(name, extension(60, header), want)
+	}
+	maximumChain := make([]byte, 6*2048)
+	for i := 0; i < 6; i++ {
+		header := maximumChain[i*2048 : (i+1)*2048]
+		header[0], header[1] = 60, 255
+		for offset := 2; offset < len(header); {
+			size := min(257, len(header)-offset)
+			header[offset], header[offset+1] = 1, byte(size-2)
+			offset += size
+		}
+	}
+	maximumChain[5*2048] = 17
+	run("IPv6 six maximum length extensions", build(60, append(maximumChain, udp...)), 0)
 	p := build(17, udp)
 	binary.BigEndian.PutUint16(p[18:], 0)
 	run("IPv6 unsupported jumbogram", p, 2)

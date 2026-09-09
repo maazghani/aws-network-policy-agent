@@ -23,7 +23,7 @@ jobs:
       - name: Install kernel test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic iproute2 iptables
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic iproute2 iptables tcpdump
           # Ubuntu's bpftool wrapper may demand a package matching the hosted
           # kernel. Select the packaged executable directly when available.
           bpftool_binary=$(find -L /usr/lib/linux-tools -type f -name bpftool | sort | tail -n 1)

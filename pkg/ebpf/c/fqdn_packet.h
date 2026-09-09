@@ -50,29 +50,39 @@ static __noinline int fqdn_ipv4_options(void *header, void *end, __u32 ihl)
 
 /* At most 32 TLVs per extension header. Reject mobile IPv6 home-address
  * rewriting and jumbograms: neither may change the identity after TC.
+ * Read by skb offset so the verifier does not multiply variable packet-pointer
+ * states for every option in every extension. This subprogram uses only bounded
+ * scalar offsets; the caller has checked the full extension is in the packet.
  */
-static __noinline int fqdn_ipv6_options(void *header, void *end, __u32 length)
+#ifdef FQDN_IPV6
+static __noinline int fqdn_ipv6_options(struct __sk_buff *skb, __u32 header_offset, __u32 length)
 {
+    if (header_offset > 54 + 5 * 2048 || length < 8 || length > 2048)
+        return -1;
     __u64 offset = 2;
     for (__u64 n = 0; n < 32; n++) {
         if (offset >= length)
             return 0;
-        __u8 *option = header + offset;
-        if (option + 1 > (__u8 *)end)
+        __u8 type;
+        if (bpf_skb_load_bytes(skb, header_offset + offset, &type, sizeof(type)))
             return -1;
-        if (option[0] == 0) { /* Pad1 */
+        if (type == 0) { /* Pad1 */
             offset++;
             continue;
         }
-        if (option[0] == 201 || option[0] == 194 || option + 2 > (__u8 *)end)
+        if (type == 201 || type == 194 || offset + 1 >= length)
             return -1;
-        __u64 size = (__u64)option[1] + 2;
+        __u8 payload_length;
+        if (bpf_skb_load_bytes(skb, header_offset + offset + 1, &payload_length, sizeof(payload_length)))
+            return -1;
+        __u64 size = (__u64)payload_length + 2;
         if (size > (__u64)length - offset)
             return -1;
         offset += size;
     }
     return offset == length ? 0 : -1;
 }
+#endif
 
 /* Strict parsing is used only for enrolled endpoints. Fragmented IP is rejected
  * before legacy conntrack; neither a non-initial fragment nor IPv4 options may
@@ -125,6 +135,7 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
         __builtin_memcpy(p->tuple.dst, &ip->daddr, 16);
         __u8 next = ip->nexthdr;
         l4 = (void *)(ip + 1);
+        __u32 header_offset = sizeof(*eth) + sizeof(*ip);
         for (__u64 n = 0; n < 6; n++) {
             if (next == 43 || next == 44) /* Source routing and all fragments. */
                 return -1;
@@ -136,10 +147,11 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
             __u32 length = next == 51 ? ((__u32)ext->hdrlen + 2) * 4 : ((__u32)ext->hdrlen + 1) * 8;
             if (length > transport_len || length < 8 || l4 + length > end || (next == 51 && length < 12))
                 return -1;
-            if (next != 51 && fqdn_ipv6_options(l4, end, length))
+            if (next != 51 && fqdn_ipv6_options(skb, header_offset, length))
                 return -1;
             next = ext->nexthdr;
             l4 += length;
+            header_offset += length;
             transport_len -= length;
         }
         if (next == 0 || next == 43 || next == 44 || next == 60 || next == 51 || next == 50)

@@ -15,12 +15,27 @@ if [[ ${1:-} == --isolated ]]; then
     export FQDN_TEST_ISOLATED=1 FQDN_TEST_FAMILY="$family" FQDN_TEST_REPO="$repo"
     mkdir -p "$repo/test-results"
     export AWS_EBPF_SDK_LOG_FILE="$repo/test-results/sdk-ipv${family}.jsonl"
+    capture="$repo/test-results/dns-ipv${family}.pcap"
+    # The private namespace contains only synthetic test endpoints. Retain
+    # packet-level evidence for TCP handshake/reset and resolver tuple failures.
+    tcpdump -i any -U -Z root -w "$capture" 'port 53' > "$repo/test-results/capture-ipv${family}.txt" 2>&1 &
+    capture_pid=$!
     test_status=0
     "$test_binary" -test.v -test.timeout=180s || test_status=$?
+    kill -INT "$capture_pid" 2>/dev/null || true
+    wait "$capture_pid" || true
+    if [[ -f "$capture" ]]; then
+        chmod 0644 "$capture"
+        tcpdump -nn -tt -r "$capture" 'tcp port 53' > "$repo/test-results/tcp-ipv${family}.txt" 2>&1
+        chmod 0644 "$repo/test-results/tcp-ipv${family}.txt"
+    fi
     # These logs contain only synthetic test endpoints. Lumberjack creates them
     # root-only; make this explicitly created artifact readable by the CI user.
     if [[ -f "$AWS_EBPF_SDK_LOG_FILE" ]]; then chmod 0644 "$AWS_EBPF_SDK_LOG_FILE"; fi
     if [[ $test_status != 0 ]]; then
+        if [[ -f "$repo/test-results/tcp-ipv${family}.txt" ]]; then
+            tail -n 120 "$repo/test-results/tcp-ipv${family}.txt"
+        fi
         # SDK defaults to a private file. Decode its verifier tail rather than
         # lose the decisive failure behind an errno; retain the full artifact.
         python3 - "$AWS_EBPF_SDK_LOG_FILE" <<'PY'
@@ -55,7 +70,7 @@ if missing:
     sys.exit('Cannot qualify FQDN datapath: missing ' + ', '.join(missing) +
              '; uid 0 alone is insufficient. No tests were skipped or passed.')
 PY
-for command in go clang ip iptables ip6tables mount unshare; do
+for command in go clang ip iptables ip6tables mount unshare tcpdump; do
     command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
 done
 

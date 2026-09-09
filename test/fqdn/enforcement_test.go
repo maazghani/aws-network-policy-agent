@@ -52,6 +52,7 @@ func TestKernelEnforcement(t *testing.T) {
 		f.grant(f.target, 6, 443, 443, bootNS(t)-1)
 		check(t, 6, 443, 2, denied)
 	})
+	t.Run("established TCP lifetime and revocation", func(t *testing.T) { f.flowChecks(t) })
 	t.Run("generation invalidates old grants", func(t *testing.T) {
 		f.grant(f.target, 17, 443, 443, bootNS(t)+uint64(time.Minute))
 		check(t, 17, 443, 0, allowed)

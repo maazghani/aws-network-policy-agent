@@ -19,7 +19,10 @@ RUN go mod download
 
 COPY . ./
 
-RUN make build-linux
+# The buildx Go stage runs on BUILDPLATFORM. Cross-compile every executable for
+# the image platform; these Go packages use the SDK's syscall implementation and
+# do not need a cross C compiler.
+RUN make build-linux GO_ARCH="${TARGETARCH}" CGO_ENABLED=0
 
 # Vmlinux
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 as vmlinuxbuilder

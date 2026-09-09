@@ -13,7 +13,10 @@ spec:
   containers:
     - name: http
       image: public.ecr.aws/docker/library/python:3.12-alpine
-      command: [python3, -m, http.server, '8080', --bind, '::']
+      command: [sh, -c, 'exec python3 -m http.server 8080 --bind "$POD_IP"']
+      env:
+        - name: POD_IP
+          valueFrom: {fieldRef: {fieldPath: status.podIP}}
 ---
 apiVersion: v1
 kind: Pod
@@ -25,7 +28,10 @@ spec:
   containers:
     - name: http
       image: public.ecr.aws/docker/library/python:3.12-alpine
-      command: [python3, -m, http.server, '8080', --bind, '::']
+      command: [sh, -c, 'exec python3 -m http.server 8080 --bind "$POD_IP"']
+      env:
+        - name: POD_IP
+          valueFrom: {fieldRef: {fieldPath: status.podIP}}
 ---
 apiVersion: v1
 kind: Service
