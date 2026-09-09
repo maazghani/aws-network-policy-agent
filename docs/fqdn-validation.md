@@ -62,6 +62,15 @@ do not establish a production p99 budget.
 
 ## Recorded CI evidence
 
+The final [FQDN validation run at `fac7a6f9`](https://github.com/maazghani/aws-network-policy-agent/actions/runs/34323261540)
+passed all stages: real IPv4/IPv6 TC and transparent socket tests, unit/race tests
+and parser fuzz seeds, userspace microbenchmarks, and evidence artifact upload.
+The [automatic validation run at `dc73052c`](https://github.com/maazghani/aws-network-policy-agent/actions/runs/34322074817)
+also passed AMD64/ARM64 image builds, repository unit tests, vet, formatting,
+vulnerability scanning and API deprecation checks. Production source is unchanged
+between those checkpoints; subsequent fixes concern the kernel test fixtures and
+CI cache ownership. ARM64 image build success is not an ARM64 kernel test result.
+
 These runs used the workflow's Ubuntu 24.04 hosted amd64 runner on 2026-09-09.
 The environment and synthetic packet captures are retained in the run artifacts.
 Failures are recorded alongside passing assertions; none of these results is an
