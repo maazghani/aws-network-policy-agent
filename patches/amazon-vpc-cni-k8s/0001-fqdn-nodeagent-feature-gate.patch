@@ -1,0 +1,62 @@
+diff --git a/charts/aws-vpc-cni/templates/daemonset.yaml b/charts/aws-vpc-cni/templates/daemonset.yaml
+index 2180461..d67211a 100644
+--- a/charts/aws-vpc-cni/templates/daemonset.yaml
++++ b/charts/aws-vpc-cni/templates/daemonset.yaml
+@@ -157,6 +157,27 @@ spec:
+             - --conntrack-cache-cleanup-period={{ .Values.nodeAgent.conntrackCacheCleanupPeriod }}
+             - --conntrack-cache-table-size={{ .Values.nodeAgent.conntrackCacheTableSize }}
+             - --log-level={{ .Values.nodeAgent.logLevel }}
++          {{- if .Values.nodeAgent.fqdn.enabled }}
++          {{- if ne (toString .Values.enableNetworkPolicy) "true" }}
++          {{- fail "nodeAgent.fqdn.enabled requires enableNetworkPolicy=true" }}
++          {{- end }}
++            - --enable-fqdn-egress=true
++            - --fqdn-diagnostics={{ .Values.nodeAgent.fqdn.diagnostics }}
++            - --fqdn-proxy-port={{ .Values.nodeAgent.fqdn.proxyPort }}
++            - --fqdn-max-endpoints={{ required "Set nodeAgent.fqdn.maxEndpoints from qualification results" .Values.nodeAgent.fqdn.maxEndpoints }}
++            - --fqdn-max-rules-per-endpoint={{ required "Set nodeAgent.fqdn.maxRulesPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxRulesPerEndpoint }}
++            - --fqdn-max-observations-per-endpoint={{ required "Set nodeAgent.fqdn.maxObservationsPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxObservationsPerEndpoint }}
++            - --fqdn-max-addresses-per-endpoint={{ required "Set nodeAgent.fqdn.maxAddressesPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxAddressesPerEndpoint }}
++            - --fqdn-max-grants-per-address={{ required "Set nodeAgent.fqdn.maxGrantsPerAddress from qualification results" .Values.nodeAgent.fqdn.maxGrantsPerAddress }}
++            - --fqdn-max-grants-per-endpoint={{ required "Set nodeAgent.fqdn.maxGrantsPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxGrantsPerEndpoint }}
++            - --fqdn-max-total-observations={{ required "Set nodeAgent.fqdn.maxTotalObservations from qualification results" .Values.nodeAgent.fqdn.maxTotalObservations }}
++            - --fqdn-max-total-grants={{ required "Set nodeAgent.fqdn.maxTotalGrants from qualification results" .Values.nodeAgent.fqdn.maxTotalGrants }}
++            - --fqdn-max-pending={{ required "Set nodeAgent.fqdn.maxPending from qualification results" .Values.nodeAgent.fqdn.maxPending }}
++            - --fqdn-max-pending-bytes={{ required "Set nodeAgent.fqdn.maxPendingBytes from qualification results" .Values.nodeAgent.fqdn.maxPendingBytes }}
++            - --fqdn-max-tcp-sockets={{ required "Set nodeAgent.fqdn.maxTcpSockets from qualification results" .Values.nodeAgent.fqdn.maxTcpSockets }}
++            - --fqdn-exchange-timeout={{ required "Set nodeAgent.fqdn.exchangeTimeout from qualification results" .Values.nodeAgent.fqdn.exchangeTimeout }}
++            - --fqdn-tcp-idle-timeout={{ required "Set nodeAgent.fqdn.tcpIdleTimeout from qualification results" .Values.nodeAgent.fqdn.tcpIdleTimeout }}
++          {{- end }}
+           {{- with default .Values.resources .Values.nodeAgent.resources }}
+           resources:
+             {{- toYaml . | nindent 12 }}
+diff --git a/charts/aws-vpc-cni/values.yaml b/charts/aws-vpc-cni/values.yaml
+index c2f2332..797c93a 100644
+--- a/charts/aws-vpc-cni/values.yaml
++++ b/charts/aws-vpc-cni/values.yaml
+@@ -51,6 +51,25 @@ nodeAgent:
+   enableIpv6: "false"
+   metricsBindAddr: "8162"
+   healthProbeBindAddr: "8163"
++  # Experimental; deploy only on qualified canary nodes with the matching image.
++  fqdn:
++    enabled: false
++    diagnostics: false
++    proxyPort: 15353
++    # Set explicit budgets after running the FQDN qualification/load suite.
++    maxEndpoints: 0
++    maxRulesPerEndpoint: 0
++    maxObservationsPerEndpoint: 0
++    maxAddressesPerEndpoint: 0
++    maxGrantsPerAddress: 0
++    maxGrantsPerEndpoint: 0
++    maxTotalObservations: 0
++    maxTotalGrants: 0
++    maxPending: 0
++    maxPendingBytes: 0
++    maxTcpSockets: 0
++    exchangeTimeout: ""
++    tcpIdleTimeout: ""
+   conntrackCacheCleanupPeriod: 300
+   conntrackCacheTableSize: 524288
+   logLevel: "debug"

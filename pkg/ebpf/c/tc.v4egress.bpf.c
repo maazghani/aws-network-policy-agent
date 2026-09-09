@@ -334,9 +334,15 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 }
 
 
+#include "fqdn_egress.h"
+
 SEC("tc_cls")
 int handle_egress(struct __sk_buff *skb)
 {
+	int fqdn_result = fqdn_handle_egress(skb);
+	if (fqdn_result != FQDN_DEFER)
+		return fqdn_result;
+
 	struct keystruct trie_key;
 	__u32 l4_src_port = 0;
 	__u32 l4_dst_port = 0;
@@ -491,5 +497,5 @@ int handle_egress(struct __sk_buff *skb)
 	return BPF_OK;
 }
 
-const volatile __u32 NPA_FILE_VERSION = 2;
+const volatile __u32 NPA_FILE_VERSION = 3;
 char _license[] SEC("license") = "GPL";

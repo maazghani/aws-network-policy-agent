@@ -58,6 +58,7 @@ type ControllerConfig struct {
 	RuntimeConfig RuntimeConfig
 	// Configuration for enabling profiling
 	EnableProfiling bool
+	FQDN            FQDNConfig
 }
 
 func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
@@ -81,6 +82,7 @@ func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&cfg.ConntrackCacheTableSize, flagConntrackCacheTableSize, defaultConntrackCacheTableSize, ""+
 		"Table size for network policy agent conntrack cache")
 
+	cfg.FQDN.BindFlags(fs)
 	cfg.RuntimeConfig.BindFlags(fs)
 }
 
@@ -90,5 +92,5 @@ func (cfg *ControllerConfig) ValidControllerFlags() error {
 	if cfg.ConntrackCacheTableSize < (32*1024) || cfg.ConntrackCacheTableSize > (1024*1024) {
 		return errors.New("Invalid conntrack cache table size, should be between 32K and 1024K")
 	}
-	return nil
+	return cfg.FQDN.Validate(cfg.EnableNetworkPolicy)
 }

@@ -28,6 +28,9 @@ struct data_t {
     __u8 tier;
 };
 
+#define FQDN_DEFINE_MAPS
+#include "fqdn.h"
+
 struct conntrack_key {
    __u32 src_ip;
    __u16 src_port;

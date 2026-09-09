@@ -1,0 +1,120 @@
+diff --git a/pkg/resolvers/applicationnetworkpolicy_namedports_test.go b/pkg/resolvers/applicationnetworkpolicy_namedports_test.go
+new file mode 100644
+index 0000000..e40114f
+--- /dev/null
++++ b/pkg/resolvers/applicationnetworkpolicy_namedports_test.go
+@@ -0,0 +1,69 @@
++package resolvers
++
++import (
++	"context"
++	"testing"
++
++	policyinfo "github.com/aws/amazon-network-policy-controller-k8s/api/v1alpha1"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	networking "k8s.io/api/networking/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
++	"sigs.k8s.io/controller-runtime/pkg/log/zap"
++)
++
++func TestFQDNPortsNeverWidenNamedPorts(t *testing.T) {
++	r := &applicationNetworkPolicyEndpointsResolver{logger: zap.New()}
++	named, numeric := intstr.FromString("https"), intstr.FromInt(443)
++	end := int32(445)
++	udp := corev1.ProtocolUDP
++	for _, tt := range []struct {
++		name   string
++		ports  []networking.NetworkPolicyPort
++		want   []policyinfo.Port
++		denied bool
++	}{
++		{name: "named only", ports: []networking.NetworkPolicyPort{{Port: &named}}, denied: true},
++		{name: "mixed named and numeric", ports: []networking.NetworkPolicyPort{{Port: &named}, {Port: &numeric}}, want: []policyinfo.Port{{Port: int32Ptr(443)}}},
++		{name: "range", ports: []networking.NetworkPolicyPort{{Port: &numeric, EndPort: &end}}, want: []policyinfo.Port{{Port: int32Ptr(443), EndPort: &end}}},
++		{name: "omitted list"},
++		{name: "omitted port", ports: []networking.NetworkPolicyPort{{Protocol: &udp}}, want: []policyinfo.Port{{Protocol: &udp}}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			got := r.resolveFQDNRules([]policyinfo.DomainName{"example.com"}, tt.ports)
++			if tt.denied {
++				require.Empty(t, got)
++				return
++			}
++			require.Len(t, got, 1)
++			require.Len(t, got[0].Ports, len(tt.want))
++			for i, want := range tt.want {
++				require.Equal(t, want.Port, got[0].Ports[i].Port)
++				require.Equal(t, want.EndPort, got[0].Ports[i].EndPort)
++				protocol := corev1.ProtocolTCP
++				if want.Protocol != nil {
++					protocol = *want.Protocol
++				}
++				require.Equal(t, protocol, *got[0].Ports[i].Protocol)
++			}
++		})
++	}
++}
++
++func TestFQDNNamedPortRejectionRetainsEgressIsolation(t *testing.T) {
++	r := &applicationNetworkPolicyEndpointsResolver{logger: zap.New()}
++	named := intstr.FromString("https")
++	policy := &policyinfo.ApplicationNetworkPolicy{Spec: policyinfo.ApplicationNetworkPolicySpec{
++		PolicyTypes: []networking.PolicyType{networking.PolicyTypeEgress},
++		Egress: []policyinfo.ApplicationNetworkPolicyEgressRule{{
++			Ports: []networking.NetworkPolicyPort{{Port: &named}},
++			To:    []policyinfo.ApplicationNetworkPolicyPeer{{DomainNames: []policyinfo.DomainName{"example.com"}}},
++		}},
++	}}
++	endpoints, err := r.computeApplicationNetworkPolicyEgressEndpoints(context.Background(), policy)
++	require.NoError(t, err)
++	require.Empty(t, endpoints)
++	require.Equal(t, []networking.PolicyType{networking.PolicyTypeEgress}, policy.Spec.PolicyTypes)
++	require.Equal(t, policy.Spec.PolicyTypes, r.convertApplicationNetworkPolicyToNetworkPolicyWithNoEgress(policy).Spec.PolicyTypes)
++}
++
+diff --git a/pkg/resolvers/applicationnetworkpolicy_resolver.go b/pkg/resolvers/applicationnetworkpolicy_resolver.go
+index 56f9cf9..0cb480f 100644
+--- a/pkg/resolvers/applicationnetworkpolicy_resolver.go
++++ b/pkg/resolvers/applicationnetworkpolicy_resolver.go
+@@ -9,6 +9,7 @@ import (
+ 	corev1 "k8s.io/api/core/v1"
+ 	networking "k8s.io/api/networking/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/intstr"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+ 
+@@ -154,13 +155,21 @@ func (r *applicationNetworkPolicyEndpointsResolver) resolveFQDNRules(domainNames
+ 	// Convert ports to policyinfo.Port format
+ 	var portList []policyinfo.Port
+ 	for _, port := range ports {
++		// A DNS destination has no Kubernetes pod on which to resolve a named
++		// port. Dropping its port value would silently permit every port.
++		// Reject only this unsupported alternative, preserving numeric peers and
++		// the policy's PodIsolation even if none of its FQDN ports are usable.
++		if port.Port != nil && port.Port.Type == intstr.String {
++			r.logger.Info("Ignoring unsupported named port for FQDN destination", "port", port.Port.StrVal)
++			continue
++		}
+ 		protocol := corev1.ProtocolTCP
+ 		if port.Protocol != nil {
+ 			protocol = *port.Protocol
+ 		}
+ 
+ 		var portPtr *int32
+-		if port.Port != nil && port.Port.Type == 0 { // IntVal
++		if port.Port != nil && port.Port.Type == intstr.Int {
+ 			portVal := int32(port.Port.IntValue())
+ 			portPtr = &portVal
+ 		}
+@@ -171,6 +180,9 @@ func (r *applicationNetworkPolicyEndpointsResolver) resolveFQDNRules(domainNames
+ 			EndPort:  port.EndPort,
+ 		})
+ 	}
++	if len(ports) > 0 && len(portList) == 0 {
++		return nil
++	}
+ 
+ 	// Create endpoint for each domain name (pass-through approach)
+ 	for _, domain := range domainNames {

@@ -1,0 +1,80 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fqdn-acceptance
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: allowed-server
+  namespace: fqdn-acceptance
+  labels: {app: allowed-server}
+spec:
+  containers:
+    - name: http
+      image: public.ecr.aws/docker/library/python:3.12-alpine
+      command: [python3, -m, http.server, '8080', --bind, '::']
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: denied-server
+  namespace: fqdn-acceptance
+  labels: {app: denied-server}
+spec:
+  containers:
+    - name: http
+      image: public.ecr.aws/docker/library/python:3.12-alpine
+      command: [python3, -m, http.server, '8080', --bind, '::']
+---
+apiVersion: v1
+kind: Service
+metadata: {name: allowed, namespace: fqdn-acceptance}
+spec:
+  selector: {app: allowed-server}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: denied, namespace: fqdn-acceptance}
+spec:
+  selector: {app: denied-server}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: fqdn-acceptance
+  labels: {role: fqdn-client}
+spec:
+  nodeSelector: {fqdn.nodeagent.k8s.aws/qualified: 'true'}
+  containers:
+    - name: python
+      image: public.ecr.aws/docker/library/python:3.12-alpine
+      command: [sleep, '3600']
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sibling
+  namespace: fqdn-acceptance
+  labels: {role: fqdn-client}
+spec:
+  nodeSelector: {fqdn.nodeagent.k8s.aws/qualified: 'true'}
+  containers:
+    - name: python
+      image: public.ecr.aws/docker/library/python:3.12-alpine
+      command: [sleep, '3600']
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: control
+  namespace: fqdn-acceptance
+  labels: {role: control}
+spec:
+  containers:
+    - name: python
+      image: public.ecr.aws/docker/library/python:3.12-alpine
+      command: [sleep, '3600']

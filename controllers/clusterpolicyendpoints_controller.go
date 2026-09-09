@@ -95,7 +95,8 @@ type ClusterPolicyEndpointsReconciler struct {
 	// Maps ClusterNetworkPolicy to list of selected pod Identifiers
 	clusterNetworkPolicyToPodIdentifierMap sync.Map
 
-	ebpfClient ebpf.BpfClient
+	ebpfClient        ebpf.BpfClient
+	fqdnPolicyHandler *FQDNPolicyHandler
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=clusterpolicyendpoints,verbs=get;list;watch
@@ -103,7 +104,14 @@ type ClusterPolicyEndpointsReconciler struct {
 
 func (r *ClusterPolicyEndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log().Infof("Received a new reconcile request for ClusterPolicyEndpoint %v", req)
-	if err := r.reconcile(ctx, req); err != nil {
+	reconcile := func() error { return r.reconcile(ctx, req) }
+	var err error
+	if r.fqdnPolicyHandler != nil {
+		err = r.fqdnPolicyHandler.apply(ctx, "", reconcile)
+	} else {
+		err = reconcile()
+	}
+	if err != nil {
 		log().Errorf("ClusterPolicyEndpoint reconcile error: %v", err)
 		return ctrl.Result{}, err
 	}
@@ -192,6 +200,7 @@ func (r *ClusterPolicyEndpointsReconciler) reconcileClusterPolicyEndpoint(ctx co
 	r.commitClusterPolicyEndpointState(resourceName, targetPods, targetPodIdentifiers, parentCPEList)
 
 	programmingSucceeded := true
+	var programmingErrors error
 	for podIdentifier := range targetPodIdentifiers {
 		ingressRules, egressRules, err := r.deriveClusterPolicyIngressAndEgressFirewallRules(ctx, podIdentifier, ClusterPolicyEndpoint.Name, false)
 		if err != nil {
@@ -201,12 +210,13 @@ func (r *ClusterPolicyEndpointsReconciler) reconcileClusterPolicyEndpoint(ctx co
 		if err := r.configureClusterPolicyBPFProbes(podIdentifier, targetPods, ingressRules, egressRules); err != nil {
 			log().Errorf("Error configuring Cluster Policy eBPF Probes %v", err)
 			programmingSucceeded = false
+			programmingErrors = errors.Join(programmingErrors, err)
 		}
 	}
 
 	r.observeClusterPolicyProgrammingLatency(ClusterPolicyEndpoint, programmingSucceeded)
 
-	return nil
+	return programmingErrors
 }
 
 // observeClusterPolicyProgrammingLatency emits the E2E latency histogram from

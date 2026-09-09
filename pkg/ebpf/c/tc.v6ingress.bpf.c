@@ -317,9 +317,16 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 }
 
 
+#define FQDN_IPV6
+#include "fqdn_ingress.h"
+
 SEC("tc_cls")
 int handle_ingress(struct __sk_buff *skb)
 {
+	int fqdn_result = fqdn_handle_ingress(skb);
+	if (fqdn_result != FQDN_DEFER)
+		return fqdn_result;
+
 	struct keystruct trie_key;
 	__u16 l4_src_port = 0;
 	__u16 l4_dst_port = 0;
@@ -472,5 +479,5 @@ int handle_ingress(struct __sk_buff *skb)
 	return BPF_OK;
 }
 
-const volatile __u32 NPA_FILE_VERSION = 2;
+const volatile __u32 NPA_FILE_VERSION = 3;
 char _license[] SEC("license") = "GPL";

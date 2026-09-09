@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -139,8 +140,9 @@ type PolicyEndpointsReconciler struct {
 	// Maps a Network Policy to list of selected pod Identifiers
 	networkPolicyToPodIdentifierMap sync.Map
 	//BPF Client instance
-	ebpfClient ebpf.BpfClient
-	enableIPv6 bool
+	ebpfClient        ebpf.BpfClient
+	enableIPv6        bool
+	fqdnPolicyHandler *FQDNPolicyHandler
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.aws,resources=policyendpoints,verbs=get;list;watch
@@ -148,7 +150,14 @@ type PolicyEndpointsReconciler struct {
 
 func (r *PolicyEndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log().Infof("Received a new reconcile request %v", req)
-	if err := r.reconcile(ctx, req); err != nil {
+	reconcile := func() error { return r.reconcile(ctx, req) }
+	var err error
+	if r.fqdnPolicyHandler != nil {
+		err = r.fqdnPolicyHandler.apply(ctx, req.Namespace, reconcile)
+	} else {
+		err = reconcile()
+	}
+	if err != nil {
 		log().Errorf("Reconcile error: %v", err)
 		return ctrl.Result{}, err
 	}
@@ -266,6 +275,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 	}
 
 	programmingSucceeded := true
+	var programmingErrors error
 	for podIdentifier := range podIdentifiers {
 		// Derive Ingress IPs from the PolicyEndpoint
 		ingressRules, egressRules, isIngressIsolated, isEgressIsolated, err := r.deriveIngressAndEgressFirewallRules(ctx, podIdentifier,
@@ -292,6 +302,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 		if err != nil {
 			log().Errorf("Error configuring eBPF Probes %v", err)
 			programmingSucceeded = false
+			programmingErrors = errors.Join(programmingErrors, err)
 		}
 		duration := msSince(start)
 		policySetupLatency.WithLabelValues(policyEndpoint.Name, policyEndpoint.Namespace).Observe(duration)
@@ -300,7 +311,7 @@ func (r *PolicyEndpointsReconciler) reconcilePolicyEndpoint(ctx context.Context,
 	// Observe E2E policy programming latency (NPC change → NPA eBPF programmed)
 	r.observePolicyProgrammingLatency(policyEndpoint, programmingSucceeded)
 
-	return nil
+	return programmingErrors
 }
 
 // observePolicyProgrammingLatency emits the E2E latency histogram from the
@@ -487,7 +498,11 @@ func (r *PolicyEndpointsReconciler) deriveIngressAndEgressFirewallRules(ctx cont
 					continue
 				}
 				if endPointInfo.CIDR == "" {
-					log().Infof("CIDR is empty, skipping the egress rule %s, NS: %s", currentPE.Name, currentPE.Namespace)
+					egressRules = append(egressRules, fwrp.EbpfFirewallRules{
+						DomainName:  normalizeDomainName(string(endPointInfo.DomainName)),
+						PolicyOwner: policyEndpointOwner(currentPE),
+						L4Info:      endPointInfo.Ports,
+					})
 					continue
 				}
 
@@ -511,6 +526,10 @@ func (r *PolicyEndpointsReconciler) deriveIngressAndEgressFirewallRules(ctx cont
 		isEgressIsolated = false
 	}
 	return ingressRules, egressRules, isIngressIsolated, isEgressIsolated, nil
+}
+
+func normalizeDomainName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(name, "."))
 }
 
 func (r *PolicyEndpointsReconciler) deriveDefaultPodIsolation(policyEndpoint *policyk8sawsv1.PolicyEndpoint,

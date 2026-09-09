@@ -36,7 +36,7 @@ RUN make vmlinuxh
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 as bpfbuilder
 WORKDIR /bpfbuilder
 RUN yum update -y && \
-    yum install -y iproute procps-ng && \
+    yum install -y iproute procps-ng iptables && \
     yum install -y llvm clang make gcc && \
     yum install -y kernel-devel elfutils-libelf-devel zlib-devel libbpf-devel && \
     yum clean all
@@ -44,11 +44,13 @@ RUN yum update -y && \
 COPY . ./
 COPY --from=vmlinuxbuilder /vmlinuxbuilder/pkg/ebpf/c/vmlinux.h ./pkg/ebpf/c/
 RUN make build-bpf
+RUN ./scripts/package-fqdn-netfilter.sh /fqdn-rootfs
 
 # Container base image
 FROM ${base_image}
 
 WORKDIR /
+COPY --from=bpfbuilder /fqdn-rootfs/ /
 COPY --from=builder /workspace/controller .
 COPY --from=builder /workspace/aws-eks-na-cli .
 COPY --from=builder /workspace/aws-eks-na-cli-v6 .

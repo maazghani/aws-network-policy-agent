@@ -2,6 +2,8 @@ package ebpf
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 	"unsafe"
@@ -120,13 +122,16 @@ func (m *InMemoryBpfMap) BulkRefresh(newMapContents map[string][]byte) error {
 		m.contents[k] = v
 	}
 
-	// Apply deletes to kernel
+	// Apply deletes to kernel. Keep failed keys in the shadow for retries and
+	// report restrictive update failures to the caller.
+	var deleteErr error
 	for _, k := range toDelete {
 		keyByte := []byte(k)
 		keyPtr := uintptr(unsafe.Pointer(&keyByte[0]))
 
 		if err := m.bpfMap.DeleteMapEntry(keyPtr); err != nil {
 			log().Errorf("Failed to delete from kernel map for key %s: %v", k, err)
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("delete kernel entry %x: %w", []byte(k), err))
 			// Continue with other deletions
 		} else {
 			// Remove from in-memory if kernel delete operation is successful
@@ -135,7 +140,7 @@ func (m *InMemoryBpfMap) BulkRefresh(newMapContents map[string][]byte) error {
 	}
 
 	log().Infof("Bulk refresh: added/updated %d entries, deleted %d entries", len(toAdd), len(toDelete))
-	return nil
+	return deleteErr
 }
 
 // GetUnderlyingMap returns the underlying BpfMap
