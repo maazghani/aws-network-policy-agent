@@ -13,7 +13,28 @@ if [[ ${1:-} == --isolated ]]; then
     mkdir -p /sys/fs/bpf/globals/aws/{maps,programs}
     ip link set lo up
     export FQDN_TEST_ISOLATED=1 FQDN_TEST_FAMILY="$family" FQDN_TEST_REPO="$repo"
-    exec "$test_binary" -test.v -test.timeout=180s
+    mkdir -p "$repo/test-results"
+    export AWS_EBPF_SDK_LOG_FILE="$repo/test-results/sdk-ipv${family}.jsonl"
+    test_status=0
+    "$test_binary" -test.v -test.timeout=180s || test_status=$?
+    if [[ $test_status != 0 ]]; then
+        # SDK defaults to a private file. Decode its verifier tail rather than
+        # lose the decisive failure behind an errno; retain the full artifact.
+        python3 - "$AWS_EBPF_SDK_LOG_FILE" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    for line in path.read_text(errors='replace').splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get('msg', '')
+        if 'Load prog done' in message or 'Verifier log:' in message:
+            print(message[-131072:])
+PY
+    fi
+    exit "$test_status"
 fi
 
 if [[ $EUID != 0 ]]; then

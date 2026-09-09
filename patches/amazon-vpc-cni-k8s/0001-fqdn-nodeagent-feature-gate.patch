@@ -1,31 +1,55 @@
 diff --git a/charts/aws-vpc-cni/templates/daemonset.yaml b/charts/aws-vpc-cni/templates/daemonset.yaml
-index 2180461..d67211a 100644
+index 2180461..623c839 100644
 --- a/charts/aws-vpc-cni/templates/daemonset.yaml
 +++ b/charts/aws-vpc-cni/templates/daemonset.yaml
-@@ -157,6 +157,27 @@ spec:
+@@ -1,3 +1,26 @@
++{{- if eq (toString .Values.nodeAgent.fqdn.enabled) "true" -}}
++{{- if ne (toString .Values.nodeAgent.enabled) "true" -}}
++{{- fail "nodeAgent.fqdn.enabled requires nodeAgent.enabled=true" -}}
++{{- end -}}
++{{- if ne (toString .Values.enableNetworkPolicy) "true" -}}
++{{- fail "nodeAgent.fqdn.enabled requires enableNetworkPolicy=true" -}}
++{{- end -}}
++{{- if and (empty .Values.nodeAgent.image.override) (empty .Values.nodeAgent.image.overrideRepository) -}}
++{{- fail "nodeAgent.fqdn.enabled requires a qualified agent image through nodeAgent.image.override or overrideRepository" -}}
++{{- end -}}
++{{- range $key := list "maxEndpoints" "maxRulesPerEndpoint" "maxObservationsPerEndpoint" "maxAddressesPerEndpoint" "maxGrantsPerAddress" "maxGrantsPerEndpoint" "maxTotalObservations" "maxTotalGrants" "maxPending" "maxPendingBytes" "maxTcpSockets" -}}
++{{- $value := index $.Values.nodeAgent.fqdn $key -}}
++{{- $integer := int64 $value -}}
++{{- if or (kindIs "bool" $value) (le $integer (int64 0)) (ne (float64 $value) (float64 $integer)) -}}
++{{- fail (printf "Set nodeAgent.fqdn.%s to a positive integer from qualification results" $key) -}}
++{{- end -}}
++{{- end -}}
++{{- range $key := list "exchangeTimeout" "tcpIdleTimeout" -}}
++{{- if empty (index $.Values.nodeAgent.fqdn $key) -}}
++{{- fail (printf "Set nodeAgent.fqdn.%s from qualification results" $key) -}}
++{{- end -}}
++{{- end -}}
++{{- end -}}
+ kind: DaemonSet
+ apiVersion: apps/v1
+ metadata:
+@@ -157,6 +180,24 @@ spec:
              - --conntrack-cache-cleanup-period={{ .Values.nodeAgent.conntrackCacheCleanupPeriod }}
              - --conntrack-cache-table-size={{ .Values.nodeAgent.conntrackCacheTableSize }}
              - --log-level={{ .Values.nodeAgent.logLevel }}
-+          {{- if .Values.nodeAgent.fqdn.enabled }}
-+          {{- if ne (toString .Values.enableNetworkPolicy) "true" }}
-+          {{- fail "nodeAgent.fqdn.enabled requires enableNetworkPolicy=true" }}
-+          {{- end }}
++          {{- if eq (toString .Values.nodeAgent.fqdn.enabled) "true" }}
 +            - --enable-fqdn-egress=true
 +            - --fqdn-diagnostics={{ .Values.nodeAgent.fqdn.diagnostics }}
 +            - --fqdn-proxy-port={{ .Values.nodeAgent.fqdn.proxyPort }}
-+            - --fqdn-max-endpoints={{ required "Set nodeAgent.fqdn.maxEndpoints from qualification results" .Values.nodeAgent.fqdn.maxEndpoints }}
-+            - --fqdn-max-rules-per-endpoint={{ required "Set nodeAgent.fqdn.maxRulesPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxRulesPerEndpoint }}
-+            - --fqdn-max-observations-per-endpoint={{ required "Set nodeAgent.fqdn.maxObservationsPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxObservationsPerEndpoint }}
-+            - --fqdn-max-addresses-per-endpoint={{ required "Set nodeAgent.fqdn.maxAddressesPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxAddressesPerEndpoint }}
-+            - --fqdn-max-grants-per-address={{ required "Set nodeAgent.fqdn.maxGrantsPerAddress from qualification results" .Values.nodeAgent.fqdn.maxGrantsPerAddress }}
-+            - --fqdn-max-grants-per-endpoint={{ required "Set nodeAgent.fqdn.maxGrantsPerEndpoint from qualification results" .Values.nodeAgent.fqdn.maxGrantsPerEndpoint }}
-+            - --fqdn-max-total-observations={{ required "Set nodeAgent.fqdn.maxTotalObservations from qualification results" .Values.nodeAgent.fqdn.maxTotalObservations }}
-+            - --fqdn-max-total-grants={{ required "Set nodeAgent.fqdn.maxTotalGrants from qualification results" .Values.nodeAgent.fqdn.maxTotalGrants }}
-+            - --fqdn-max-pending={{ required "Set nodeAgent.fqdn.maxPending from qualification results" .Values.nodeAgent.fqdn.maxPending }}
-+            - --fqdn-max-pending-bytes={{ required "Set nodeAgent.fqdn.maxPendingBytes from qualification results" .Values.nodeAgent.fqdn.maxPendingBytes }}
-+            - --fqdn-max-tcp-sockets={{ required "Set nodeAgent.fqdn.maxTcpSockets from qualification results" .Values.nodeAgent.fqdn.maxTcpSockets }}
-+            - --fqdn-exchange-timeout={{ required "Set nodeAgent.fqdn.exchangeTimeout from qualification results" .Values.nodeAgent.fqdn.exchangeTimeout }}
-+            - --fqdn-tcp-idle-timeout={{ required "Set nodeAgent.fqdn.tcpIdleTimeout from qualification results" .Values.nodeAgent.fqdn.tcpIdleTimeout }}
++            - --fqdn-max-endpoints={{ int64 .Values.nodeAgent.fqdn.maxEndpoints }}
++            - --fqdn-max-rules-per-endpoint={{ int64 .Values.nodeAgent.fqdn.maxRulesPerEndpoint }}
++            - --fqdn-max-observations-per-endpoint={{ int64 .Values.nodeAgent.fqdn.maxObservationsPerEndpoint }}
++            - --fqdn-max-addresses-per-endpoint={{ int64 .Values.nodeAgent.fqdn.maxAddressesPerEndpoint }}
++            - --fqdn-max-grants-per-address={{ int64 .Values.nodeAgent.fqdn.maxGrantsPerAddress }}
++            - --fqdn-max-grants-per-endpoint={{ int64 .Values.nodeAgent.fqdn.maxGrantsPerEndpoint }}
++            - --fqdn-max-total-observations={{ int64 .Values.nodeAgent.fqdn.maxTotalObservations }}
++            - --fqdn-max-total-grants={{ int64 .Values.nodeAgent.fqdn.maxTotalGrants }}
++            - --fqdn-max-pending={{ int64 .Values.nodeAgent.fqdn.maxPending }}
++            - --fqdn-max-pending-bytes={{ int64 .Values.nodeAgent.fqdn.maxPendingBytes }}
++            - --fqdn-max-tcp-sockets={{ int64 .Values.nodeAgent.fqdn.maxTcpSockets }}
++            - --fqdn-exchange-timeout={{ .Values.nodeAgent.fqdn.exchangeTimeout }}
++            - --fqdn-tcp-idle-timeout={{ .Values.nodeAgent.fqdn.tcpIdleTimeout }}
 +          {{- end }}
            {{- with default .Values.resources .Values.nodeAgent.resources }}
            resources:

@@ -362,8 +362,8 @@ func (f *fixture) fullProxy(t *testing.T) {
 	binary.NativeEndian.PutUint32(admin[4:], 100)
 	f.update("cp_egress_map", append(u32(mask), deniedBytes...), admin)
 	multi := f.dns(fmt.Sprintf("udp%d", f.family), "multi.allowed.test")
-	if multi.Positive {
-		t.Fatalf("partially denied multi-address answer was released: %+v", multi)
+	if multi.Positive || multi.RCode != 2 {
+		t.Fatalf("partially denied multi-address answer did not fail with SERVFAIL: %+v", multi)
 	}
 	faults.mode.Store(1)
 	delayed := f.dns(fmt.Sprintf("udp%d", f.family), "delayed.allowed.test")
@@ -372,13 +372,13 @@ func (f *fixture) fullProxy(t *testing.T) {
 	}
 	faults.mode.Store(2)
 	failed := f.dns(fmt.Sprintf("udp%d", f.family), "failed.allowed.test")
-	if failed.Positive {
-		t.Fatalf("positive response after failed map write: %+v", failed)
+	if failed.Positive || failed.RCode != 2 {
+		t.Fatalf("failed map write did not produce SERVFAIL: %+v", failed)
 	}
 	faults.mode.Store(4)
 	detached := f.dns(fmt.Sprintf("udp%d", f.family), "detached.allowed.test")
-	if detached.Positive {
-		t.Fatalf("positive response after attachment loss: %+v", detached)
+	if detached.Positive || detached.RCode != 2 {
+		t.Fatalf("attachment loss did not produce SERVFAIL: %+v", detached)
 	}
 	if err = tc.New([]string{"eni"}).TCIngressAttach(f.host, f.egressFD, "fqdn-egress"); err != nil {
 		t.Fatal(err)

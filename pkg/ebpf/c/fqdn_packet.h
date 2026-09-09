@@ -56,6 +56,7 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
         return -1;
     void *l4;
     __u32 transport_len;
+#ifndef FQDN_IPV6
     if (eth->h_proto == bpf_htons(0x0800)) {
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > end || ip->version != 4 || ip->ihl < 5)
@@ -96,7 +97,9 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
         p->tuple.protocol = ip->protocol;
         l4 = (void *)ip + ihl;
         transport_len = total - ihl;
-    } else if (eth->h_proto == bpf_htons(0x86dd)) {
+    }
+#else
+    if (eth->h_proto == bpf_htons(0x86dd)) {
         struct ipv6hdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > end || ip->version != 6)
             return -1;
@@ -150,7 +153,11 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
                 p->essential_icmp = 2;
             }
         }
-    } else {
+    }
+#endif
+    else {
+        if (eth->h_proto == bpf_htons(0x0800) || eth->h_proto == bpf_htons(0x86dd))
+            return -1; /* Selected endpoints cannot use the other family. */
         return 1; /* ARP/non-IP: existing behavior. */
     }
     if (p->tuple.protocol == IPPROTO_TCP) {

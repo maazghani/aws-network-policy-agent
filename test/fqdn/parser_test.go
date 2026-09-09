@@ -56,8 +56,13 @@ func (f *fixture) parserChecks(t *testing.T) {
 			binary.BigEndian.PutUint16(p[16:], uint16(len(p)-14))
 			return p
 		}
+		f.static(f.target, 17, 443)
 		run("IPv4 NOP options use actual transport offset", withOptions([]byte{1, 1, 1, 1}), 0)
 		run("IPv4 EOL options", withOptions([]byte{0, 0, 0, 0}), 0)
+		wrongPort := withOptions([]byte{1, 1, 1, 1})
+		binary.BigEndian.PutUint16(wrongPort[40:], 446)
+		run("IPv4 options cannot substitute permitted port", wrongPort, 2)
+		f.static(f.target, 254, 0)
 		run("IPv4 zero option length", withOptions([]byte{7, 0, 0, 0}), 2)
 		run("IPv4 option extends beyond IHL", withOptions([]byte{7, 8, 0, 0}), 2)
 		run("IPv4 loose source route", withOptions([]byte{131, 3, 4, 0}), 2)
@@ -85,9 +90,14 @@ func (f *fixture) parserChecks(t *testing.T) {
 	extension := func(kind uint8, header []byte) []byte {
 		return build(kind, append(append([]byte(nil), header...), udp...))
 	}
+	f.static(f.target, 17, 443)
 	run("IPv6 hop-by-hop options", extension(0, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 0)
 	run("IPv6 destination options", extension(60, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 0)
 	run("IPv6 AH minimum header", extension(51, []byte{17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}), 0)
+	wrongPort := extension(60, []byte{17, 0, 0, 0, 0, 0, 0, 0})
+	binary.BigEndian.PutUint16(wrongPort[64:], 446)
+	run("IPv6 extension cannot substitute permitted port", wrongPort, 2)
+	f.static(f.target, 254, 0)
 	run("IPv6 AH truncated header", extension(51, []byte{17, 0, 0, 0, 0, 0, 0, 0}), 2)
 	run("IPv6 malformed option length", extension(60, []byte{17, 0, 1, 255, 0, 0, 0, 0}), 2)
 	run("IPv6 home address rewriting", extension(60, []byte{17, 0, 201, 0, 0, 0, 0, 0}), 2)
