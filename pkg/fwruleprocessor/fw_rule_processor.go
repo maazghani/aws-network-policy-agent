@@ -27,9 +27,13 @@ type EbpfFirewallRules struct {
 	Priority   int
 	Action     v1alpha1.ClusterNetworkPolicyRuleAction
 	DomainName string
-	IPCidr     v1alpha1.NetworkAddress
-	Except     []v1alpha1.NetworkAddress
-	L4Info     []v1alpha1.Port
+	// PolicyOwner identifies the PolicyEndpoint contribution. It is populated
+	// for FQDN rules so an endpoint-local grant can be recomputed when one of
+	// several overlapping policies is removed.
+	PolicyOwner string
+	IPCidr      v1alpha1.NetworkAddress
+	Except      []v1alpha1.NetworkAddress
+	L4Info      []v1alpha1.Port
 }
 
 type FirewallRuleProcessor struct {
@@ -88,6 +92,12 @@ func (f *FirewallRuleProcessor) ComputeMapEntriesFromEndpointRules(firewallRules
 	sortFirewallRulesByPrefixLength(firewallRules, f.hostMask)
 
 	for _, firewallRule := range firewallRules {
+		// Domain rules are consumed by the FQDN admission path. They deliberately
+		// do not enter the shared CIDR LPM trie: doing so would either turn an
+		// empty CIDR into a catch-all or share learned authority between pods.
+		if firewallRule.DomainName != "" {
+			continue
+		}
 		var cidrL4Info []v1alpha1.Port
 
 		if !strings.Contains(string(firewallRule.IPCidr), "/") {
