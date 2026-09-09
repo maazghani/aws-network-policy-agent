@@ -23,7 +23,7 @@ struct fqdn_packet {
 static __noinline int fqdn_ipv4_options(void *header, void *end, __u32 ihl)
 {
     __u64 offset = 20;
-    for (int n = 0; n < 40; n++) {
+    for (__u64 n = 0; n < 40; n++) {
         if (offset >= ihl)
             return 0;
         if (offset > 59)
@@ -54,7 +54,7 @@ static __noinline int fqdn_ipv4_options(void *header, void *end, __u32 ihl)
 static __noinline int fqdn_ipv6_options(void *header, void *end, __u32 length)
 {
     __u64 offset = 2;
-    for (int n = 0; n < 32; n++) {
+    for (__u64 n = 0; n < 32; n++) {
         if (offset >= length)
             return 0;
         __u8 *option = header + offset;
@@ -125,7 +125,7 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
         __builtin_memcpy(p->tuple.dst, &ip->daddr, 16);
         __u8 next = ip->nexthdr;
         l4 = (void *)(ip + 1);
-        for (int n = 0; n < 6; n++) {
+        for (__u64 n = 0; n < 6; n++) {
             if (next == 43 || next == 44) /* Source routing and all fragments. */
                 return -1;
             if (next != 0 && next != 60 && next != 51)

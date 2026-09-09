@@ -67,6 +67,10 @@ make build-bpf
 test_binary=$(mktemp /tmp/fqdn-kernel-tests.XXXXXX)
 trap 'rm -f "$test_binary"' EXIT
 go test -tags=fqdn_integration -c -o "$test_binary" ./test/fqdn
+qualification_status=0
 for family in 4 6; do
-    unshare --mount --net --propagation private "$0" --isolated "$family" "$test_binary"
+    # Each family owns independent namespaces and pins. Collect both results
+    # even when the first fails, while preserving an overall failing exit code.
+    unshare --mount --net --propagation private "$0" --isolated "$family" "$test_binary" || qualification_status=1
 done
+exit "$qualification_status"

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ import (
 func TestKernelEnforcement(t *testing.T) {
 	f := newFixture(t)
 	allowed, denied := uint32(0), uint32(2)
-	check := func(protocol uint8, port uint16, flags uint8, want uint32) {
+	check := func(t *testing.T, protocol uint8, port uint16, flags uint8, want uint32) {
 		t.Helper()
 		got := f.packetVerdict(f.pod, f.target, protocol, 32000, port, flags, f.ifindex)
 		if got != want {
@@ -29,13 +30,13 @@ func TestKernelEnforcement(t *testing.T) {
 		}
 	}
 
-	t.Run("no grant", func(t *testing.T) { check(17, 443, 0, denied); check(6, 443, 2, denied) })
+	t.Run("no grant", func(t *testing.T) { check(t, 17, 443, 0, denied); check(t, 6, 443, 2, denied) })
 	t.Run("UDP range and cross endpoint isolation", func(t *testing.T) {
 		f.grant(f.target, 17, 443, 445, bootNS(t)+uint64(time.Minute))
-		check(17, 443, 0, allowed)
-		check(17, 445, 0, allowed)
-		check(17, 446, 0, denied)
-		check(6, 443, 2, denied)
+		check(t, 17, 443, 0, allowed)
+		check(t, 17, 445, 0, allowed)
+		check(t, 17, 446, 0, denied)
+		check(t, 6, 443, 2, denied)
 		other := *f
 		other.ifindex = 1
 		other.lifetime = 200
@@ -44,30 +45,30 @@ func TestKernelEnforcement(t *testing.T) {
 			t.Fatalf("sibling endpoint inherited grant: %d", got)
 		}
 	})
-	t.Run("expired UDP reused tuple", func(t *testing.T) { f.grant(f.target, 17, 443, 445, bootNS(t)-1); check(17, 443, 0, denied) })
+	t.Run("expired UDP reused tuple", func(t *testing.T) { f.grant(f.target, 17, 443, 445, bootNS(t)-1); check(t, 17, 443, 0, denied) })
 	t.Run("fresh SYN cannot reuse expired flow", func(t *testing.T) {
 		f.grant(f.target, 6, 443, 443, bootNS(t)+uint64(time.Minute))
-		check(6, 443, 2, allowed)
+		check(t, 6, 443, 2, allowed)
 		f.grant(f.target, 6, 443, 443, bootNS(t)-1)
-		check(6, 443, 2, denied)
+		check(t, 6, 443, 2, denied)
 	})
 	t.Run("generation invalidates old grants", func(t *testing.T) {
 		f.grant(f.target, 17, 443, 443, bootNS(t)+uint64(time.Minute))
-		check(17, 443, 0, allowed)
+		check(t, 17, 443, 0, allowed)
 		f.generation++
 		f.endpoint(3)
-		check(17, 443, 0, denied)
+		check(t, 17, 443, 0, denied)
 	})
 	t.Run("lifetime reuse invalidates grants", func(t *testing.T) {
 		f.grant(f.target, 17, 443, 443, bootNS(t)+uint64(time.Minute))
-		check(17, 443, 0, allowed)
+		check(t, 17, 443, 0, allowed)
 		f.lifetime++
 		f.endpoint(3)
-		check(17, 443, 0, denied)
+		check(t, 17, 443, 0, denied)
 	})
 	t.Run("Admin deny overrides namespace grant", func(t *testing.T) {
 		f.grant(f.target, 17, 443, 443, bootNS(t)+uint64(time.Minute))
-		check(17, 443, 0, allowed)
+		check(t, 17, 443, 0, allowed)
 		ip := address(f.target)
 		mask := uint32(128)
 		if f.family == 4 {
@@ -79,10 +80,10 @@ func TestKernelEnforcement(t *testing.T) {
 		binary.NativeEndian.PutUint32(value, 254)
 		binary.NativeEndian.PutUint32(value[4:], 100) // Admin priority 10, deny.
 		f.update("cp_egress_map", key, value)
-		check(17, 443, 0, denied)
+		check(t, 17, 443, 0, denied)
 		binary.NativeEndian.PutUint32(value[4:], 102) // Admin pass restores namespace evaluation.
 		f.update("cp_egress_map", key, value)
-		check(17, 443, 0, allowed)
+		check(t, 17, 443, 0, allowed)
 	})
 	t.Run("source spoof is rejected before shared static allow", func(t *testing.T) {
 		f.static(f.target, 254, 0)
@@ -173,8 +174,9 @@ func (f *fixture) steering(t *testing.T) {
 		}
 	}()
 	errors := make(chan error, 100)
+	tcpState := &tcpDiagnostics{}
 	go f.serveTransparentUDP(udp, errors)
-	go f.serveTransparentTCP(tcp, errors)
+	go f.serveTransparentTCP(tcp, errors, tcpState)
 	f.proxyReady(1)
 
 	// Remove transport authorization while sockets are present. Neither a UDP
@@ -196,12 +198,14 @@ func (f *fixture) steering(t *testing.T) {
 	for _, network := range []string{"udp", "tcp"} {
 		result := f.probe(network+family, f.resolver, 53, 40)
 		if !result.Success {
+			t.Logf("TCP diagnostics: accepted=%d last_tuple=%v", tcpState.accepted.Load(), tcpState.lastTuple.Load())
 			select {
 			case err := <-errors:
-				t.Fatalf("%s proxy: %v; pod: %+v", network, err, result)
+				t.Errorf("%s proxy: %v; pod: %+v", network, err, result)
 			default:
-				t.Fatalf("steered %s failed: %+v", network, result)
+				t.Errorf("steered %s failed: %+v", network, result)
 			}
+			continue
 		}
 		if result.Remote != net.JoinHostPort(f.resolver.String(), "53") {
 			t.Fatalf("resolver tuple changed: %+v", result)
@@ -244,12 +248,19 @@ func percentile(values []int64, p int) int64 {
 	return values[index]
 }
 
-func (f *fixture) serveTransparentTCP(listener net.Listener, failures chan<- error) {
+type tcpDiagnostics struct {
+	accepted  atomic.Int64
+	lastTuple atomic.Value
+}
+
+func (f *fixture) serveTransparentTCP(listener net.Listener, failures chan<- error, state *tcpDiagnostics) {
 	for {
 		client, err := listener.Accept()
 		if err != nil {
 			return
 		}
+		state.accepted.Add(1)
+		state.lastTuple.Store(client.RemoteAddr().String() + " -> " + client.LocalAddr().String())
 		go func() {
 			defer client.Close()
 			if client.LocalAddr().String() != net.JoinHostPort(f.resolver.String(), "53") {

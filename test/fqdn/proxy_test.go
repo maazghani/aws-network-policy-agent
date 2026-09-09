@@ -352,7 +352,7 @@ func (f *fixture) fullProxy(t *testing.T) {
 			t.Errorf("proxy close: %v", err)
 		}
 	}()
-	checkPositive := func(network, name string) {
+	checkPositive := func(t *testing.T, network, name string) {
 		t.Helper()
 		result := f.dns(network+fmt.Sprint(f.family), name)
 		if !result.Positive {
@@ -365,14 +365,14 @@ func (f *fixture) fullProxy(t *testing.T) {
 			t.Fatalf("positive DNS preceded effective datapath admission: %d", got)
 		}
 	}
-	checkPositive("udp", "allowed.test")
-	checkPositive("udp", "allowed.test")
-	checkPositive("tcp", "allowed.test")
+	checkPositive(t, "udp", "allowed.test")
+	checkPositive(t, "udp", "allowed.test")
+	t.Run("persistent TCP", func(t *testing.T) { checkPositive(t, "tcp", "allowed.test") })
 	truncated := f.dns(fmt.Sprintf("udp%d", f.family), "truncated.allowed.test")
 	if !truncated.Truncated || truncated.Positive {
 		t.Fatalf("UDP truncation contract: %+v", truncated)
 	}
-	checkPositive("tcp", "truncated.allowed.test")
+	t.Run("TCP fallback", func(t *testing.T) { checkPositive(t, "tcp", "truncated.allowed.test") })
 	unmatched := f.dns(fmt.Sprintf("udp%d", f.family), "unmatched.test")
 	if !unmatched.Positive {
 		t.Fatalf("nonmatching answer should remain informational: %+v", unmatched)

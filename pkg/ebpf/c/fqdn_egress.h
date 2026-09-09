@@ -96,8 +96,17 @@ static __noinline int fqdn_assign_dns(struct __sk_buff *skb, struct fqdn_endpoin
         }
     }
     if (!socket) {
-        if (packet->tuple.protocol == IPPROTO_TCP && (!packet->syn || packet->ack))
-            return BPF_DROP;
+        if (packet->tuple.protocol == IPPROTO_TCP && (!packet->syn || packet->ack)) {
+            /* During handshake the original tuple may resolve to a request
+             * socket, not an established full socket. Permit the third ACK to
+             * reach our marked listener only when a prior redirected SYN
+             * proves this exact tuple and live endpoint. Pre-enrollment TCP
+             * cannot acquire this provenance from legacy/Linux conntrack.
+             */
+            struct fqdn_dns_value *prior = bpf_map_lookup_elem(&fqdn_dns, &packet->tuple);
+            if (!prior || prior->lifetime != ep->lifetime || prior->ifindex != skb->ifindex || prior->deadline <= now)
+                return BPF_DROP;
+        }
         /* Lookup the exclusively configured transparent loopback listener. */
 #ifdef FQDN_IPV6
         __builtin_memset(tuple.ipv6.daddr, 0, 16);
