@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -487,7 +488,17 @@ func (r *PolicyEndpointsReconciler) deriveIngressAndEgressFirewallRules(ctx cont
 					continue
 				}
 				if endPointInfo.CIDR == "" {
-					log().Infof("CIDR is empty, skipping the egress rule %s, NS: %s", currentPE.Name, currentPE.Namespace)
+					// Keep FQDN rules in the effective per-pod rule set. The static
+					// compiler ignores these entries; the dynamic admission path uses
+					// the owner to compose and revoke overlapping contributions.
+					egressRules = append(egressRules, fwrp.EbpfFirewallRules{
+						DomainName: normalizeDomainName(string(endPointInfo.DomainName)),
+						PolicyOwner: types.NamespacedName{
+							Namespace: currentPE.Namespace,
+							Name:      currentPE.Name,
+						}.String(),
+						L4Info: endPointInfo.Ports,
+					})
 					continue
 				}
 
@@ -511,6 +522,12 @@ func (r *PolicyEndpointsReconciler) deriveIngressAndEgressFirewallRules(ctx cont
 		isEgressIsolated = false
 	}
 	return ingressRules, egressRules, isIngressIsolated, isEgressIsolated, nil
+}
+
+// normalizeDomainName uses the DNS comparison form while retaining a leading
+// wildcard. PolicyEndpoint validation restricts wildcards to "*.".
+func normalizeDomainName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(name, "."))
 }
 
 func (r *PolicyEndpointsReconciler) deriveDefaultPodIsolation(policyEndpoint *policyk8sawsv1.PolicyEndpoint,
