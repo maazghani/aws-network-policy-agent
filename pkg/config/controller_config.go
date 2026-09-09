@@ -28,6 +28,7 @@ const (
 	flagConntrackCacheCleanupPeriod    = "conntrack-cache-cleanup-period"
 	flagConntrackCacheTableSize        = "conntrack-cache-table-size"
 	flagEnableProfiling                = "enable-profiling"
+	flagEnableFQDNPolicy               = "enable-fqdn-policy"
 )
 
 // ControllerConfig contains the controller configuration
@@ -58,6 +59,10 @@ type ControllerConfig struct {
 	RuntimeConfig RuntimeConfig
 	// Configuration for enabling profiling
 	EnableProfiling bool
+	// EnableFQDNPolicy enables the experimental endpoint-scoped DNS admission
+	// path. It remains disabled by default until kernel and resolver matrices
+	// have completed qualification.
+	EnableFQDNPolicy bool
 }
 
 func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
@@ -76,6 +81,7 @@ func (cfg *ControllerConfig) BindFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&cfg.EnableIPv6, flagEnableIPv6, false, "If enabled, Network Policy agent will operate in IPv6 mode")
 	fs.BoolVar(&cfg.EnableNetworkPolicy, flagEnableNetworkPolicy, false, "If enabled, Network Policy agent will initialize BPF maps and start reconciler")
 	fs.BoolVar(&cfg.EnableProfiling, flagEnableProfiling, false, "If enabled, Network Policy agent will enable profiling")
+	fs.BoolVar(&cfg.EnableFQDNPolicy, flagEnableFQDNPolicy, false, "Enable experimental endpoint-scoped FQDN egress enforcement")
 	fs.IntVar(&cfg.ConntrackCacheCleanupPeriod, flagConntrackCacheCleanupPeriod, defaultConntrackCacheCleanupPeriod, ""+
 		"Cleanup interval for network policy agent conntrack cache")
 	fs.IntVar(&cfg.ConntrackCacheTableSize, flagConntrackCacheTableSize, defaultConntrackCacheTableSize, ""+
