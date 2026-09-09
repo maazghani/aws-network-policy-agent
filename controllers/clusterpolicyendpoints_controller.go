@@ -107,7 +107,7 @@ func (r *ClusterPolicyEndpointsReconciler) Reconcile(ctx context.Context, req ct
 	reconcile := func() error { return r.reconcile(ctx, req) }
 	var err error
 	if r.fqdnPolicyHandler != nil {
-		err = r.fqdnPolicyHandler.apply(ctx, "", reconcile)
+		err = r.fqdnPolicyHandler.apply(ctx, "", "cpe/"+req.String(), reconcile)
 	} else {
 		err = reconcile()
 	}
@@ -344,6 +344,9 @@ func (r *ClusterPolicyEndpointsReconciler) deriveClusterPolicyIngressAndEgressFi
 				}
 				return nil, nil, err
 			}
+			if !currentCPE.DeletionTimestamp.IsZero() {
+				continue
+			}
 
 			for _, endPointInfo := range currentCPE.Spec.Ingress {
 				priority := int(currentCPE.Spec.Priority)
@@ -547,7 +550,7 @@ func (r *ClusterPolicyEndpointsReconciler) getClusterPolicyEndpointsOfParentCNP(
 
 	var parentClusterPolicyEndpoints []policyk8sawsv1.ClusterPolicyEndpoint
 	for _, ClusterPolicyEndpoint := range ClusterPolicyEndpointList.Items {
-		if ClusterPolicyEndpoint.Spec.PolicyRef.Name == parentCNP {
+		if ClusterPolicyEndpoint.Spec.PolicyRef.Name == parentCNP && ClusterPolicyEndpoint.DeletionTimestamp.IsZero() {
 			parentClusterPolicyEndpoints = append(parentClusterPolicyEndpoints, ClusterPolicyEndpoint)
 		}
 	}

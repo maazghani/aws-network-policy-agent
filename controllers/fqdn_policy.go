@@ -116,6 +116,9 @@ func compileFQDNRule(pe *policyv1.PolicyEndpoint, egress policyv1.EndpointInfo, 
 	encoded, _ := json.Marshal(rule)
 	digest := sha256.Sum256(encoded)
 	rule.Owner = policyEndpointOwner(pe) + "/" + hex.EncodeToString(digest[:])
+	if len(rule.Owner) > 512 {
+		return fqdn.Rule{}, fmt.Errorf("%w: owner identity too long", fqdn.ErrPolicy)
+	}
 	return rule, nil
 }
 

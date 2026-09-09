@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
+	"runtime"
 	"sort"
 	"unsafe"
 
+	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
 	"github.com/aws/aws-network-policy-agent/pkg/fqdn"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
 	"golang.org/x/sys/unix"
@@ -109,6 +112,9 @@ func (p fqdnStaticPolicy) verdict(protocol uint8, port uint16, dynamic bool) boo
 	return p.state == uint8(DEFAULT_ALLOW)
 }
 func (b *FQDNBackend) effectiveGrant(ctx context.Context, ep fqdn.Endpoint, g fqdn.Grant) (bool, error) {
+	return b.effectiveCandidate(ctx, ep, g, true)
+}
+func (b *FQDNBackend) effectiveCandidate(ctx context.Context, ep fqdn.Endpoint, g fqdn.Grant, dynamic bool) (bool, error) {
 	policy, err := b.loadStaticPolicy(ep, g.Address)
 	if err != nil {
 		return false, err
@@ -133,6 +139,17 @@ func (b *FQDNBackend) effectiveGrant(ctx context.Context, ep fqdn.Endpoint, g fq
 			boundaries = append(boundaries, r.Start+1)
 		}
 	}
+	for _, r := range policy.ports {
+		if r.Start >= lo && r.Start <= hi {
+			boundaries = append(boundaries, r.Start)
+		}
+		if r.End < hi && r.End >= lo {
+			boundaries = append(boundaries, r.End+1)
+		}
+		if r.Start < hi && r.Start >= lo {
+			boundaries = append(boundaries, r.Start+1)
+		}
+	}
 	sort.Slice(boundaries, func(i, j int) bool { return boundaries[i] < boundaries[j] })
 	first, last := int(g.Protocol), int(g.Protocol)
 	if g.Protocol == 0 {
@@ -143,7 +160,7 @@ func (b *FQDNBackend) effectiveGrant(ctx context.Context, ep fqdn.Endpoint, g fq
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
-			if policy.verdict(uint8(proto), uint16(port), true) {
+			if policy.verdict(uint8(proto), uint16(port), dynamic) {
 				return true, nil
 			}
 		}
@@ -178,6 +195,15 @@ func (b *FQDNBackend) reconcileFlows(ctx context.Context, s *fqdnBinding, revisi
 		return err
 	}
 	names := map[fqdnFlowKey][]string{}
+	proofCount := 0
+	for _, other := range b.bound {
+		if other == s {
+			continue
+		}
+		for _, proof := range other.flowNames {
+			proofCount += len(proof)
+		}
+	}
 	for _, raw := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -201,6 +227,9 @@ func (b *FQDNBackend) reconcileFlows(ctx context.Context, s *fqdnBinding, revisi
 		for _, g := range s.observations {
 			if g.Address == address && (g.Protocol == 0 || g.Protocol == key.Tuple.Protocol) && (g.StartPort == 0 || key.Tuple.DestinationPort == g.StartPort || (g.EndPort > 0 && key.Tuple.DestinationPort >= g.StartPort && key.Tuple.DestinationPort <= g.EndPort)) {
 				proof = appendUniqueNames(proof, g.Names)
+				if len(proof) > 256 {
+					return fmt.Errorf("per-flow name provenance: %w", fqdn.ErrCapacity)
+				}
 			}
 		}
 		policy, err := b.loadStaticPolicy(s.endpoint, address)
@@ -243,6 +272,10 @@ func (b *FQDNBackend) reconcileFlows(ctx context.Context, s *fqdnBinding, revisi
 				return err
 			}
 		}
+		proofCount += len(proof)
+		if proofCount > 1<<20 {
+			return fmt.Errorf("total flow name provenance: %w", fqdn.ErrCapacity)
+		}
 		names[key] = proof
 	}
 	s.flowNames = names
@@ -257,7 +290,7 @@ func appendUniqueNames(to, from []string) []string {
 				break
 			}
 		}
-		if !found && len(to) < 24 {
+		if !found {
 			to = append(to, s)
 		}
 	}
@@ -271,13 +304,114 @@ func fqdnMapSyscall(fd uint32, command int, key, value []byte) error {
 	attr := struct {
 		FD, Pad           uint32
 		Key, Value, Flags uint64
-	}{FD: fd, Key: uint64(uintptr(unsafe.Pointer(&key[0])))}
+	}{FD: fd}
+	if len(key) > 0 {
+		attr.Key = uint64(uintptr(unsafe.Pointer(&key[0])))
+	}
 	if len(value) > 0 {
 		attr.Value = uint64(uintptr(unsafe.Pointer(&value[0])))
 	}
 	_, _, errno := unix.Syscall(unix.SYS_BPF, uintptr(command), uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(value)
 	if errno != 0 {
 		return errno
 	}
 	return nil
+}
+
+// CheckStatic admits an informational/zero-TTL answer only when every address
+// is independently reachable through the currently attached static policy.
+// No DNS expiry or map insertion is treated as static authority.
+func (b *FQDNBackend) CheckStatic(ctx context.Context, ep fqdn.Endpoint, candidates []fqdn.Grant) error {
+	s, err := b.binding(ep)
+	if err != nil {
+		return err
+	}
+	if err := b.Check(ctx, ep, s.revision, nil); err != nil {
+		return err
+	}
+	addresses := map[netip.Addr]bool{}
+	for _, g := range candidates {
+		if _, ok := addresses[g.Address]; !ok {
+			addresses[g.Address] = false
+		}
+		allowed, err := b.effectiveCandidate(ctx, ep, g, false)
+		if err != nil {
+			return err
+		}
+		addresses[g.Address] = addresses[g.Address] || allowed
+	}
+	for _, allowed := range addresses {
+		if !allowed {
+			return fqdn.ErrNoPermission
+		}
+	}
+	return ctx.Err()
+}
+
+// Map iteration must terminate even if another CPU deletes the current key and
+// causes GET_NEXT_KEY to restart. Kernel max_entries bounds both work and memory.
+func fqdnMapKeys(m goebpfmaps.BpfMap) ([]string, error) {
+	if m.MapMetaData.KeySize == 0 || m.MapMetaData.MaxEntries == 0 {
+		return nil, errors.New("invalid FQDN map iteration metadata")
+	}
+	var key []byte
+	next := make([]byte, m.MapMetaData.KeySize)
+	seen := make(map[string]struct{})
+	keys := []string{}
+	for i := uint32(0); i <= m.MapMetaData.MaxEntries; i++ {
+		err := fqdnMapSyscall(m.MapFD, unix.BPF_MAP_GET_NEXT_KEY, key, next)
+		if errors.Is(err, unix.ENOENT) {
+			return keys, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		raw := string(next)
+		if _, ok := seen[raw]; !ok {
+			keys = append(keys, raw)
+			seen[raw] = struct{}{}
+		}
+		key = append(key[:0], next...)
+	}
+	return nil, fmt.Errorf("FQDN map churn exceeded bounded iteration: %w", fqdn.ErrCapacity)
+}
+
+// Duplicate answers and additions under an unchanged policy need no flow scan.
+// Retained observations remain sufficient proof until a contributing name or
+// address is removed; capture bounded per-flow proof at that transition.
+func flowProofChanges(s *fqdnBinding, revision uint64, next []fqdn.Grant) bool {
+	if s.revision != revision {
+		return true
+	}
+	type permission struct {
+		address    netip.Addr
+		protocol   uint8
+		start, end uint16
+	}
+	names := map[permission]map[string]struct{}{}
+	for _, g := range next {
+		k := permission{g.Address, g.Protocol, g.StartPort, g.EndPort}
+		set := names[k]
+		if set == nil {
+			set = map[string]struct{}{}
+			names[k] = set
+		}
+		for _, name := range g.Names {
+			set[name] = struct{}{}
+		}
+	}
+	for _, g := range s.observations {
+		set, ok := names[permission{g.Address, g.Protocol, g.StartPort, g.EndPort}]
+		if !ok {
+			return true
+		}
+		for _, name := range g.Names {
+			if _, ok := set[name]; !ok {
+				return true
+			}
+		}
+	}
+	return false
 }

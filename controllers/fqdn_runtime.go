@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 
 	policyv1 "github.com/aws/aws-network-policy-agent/api/v1alpha1"
@@ -21,8 +22,8 @@ import (
 
 type FQDNEndpointResolver interface {
 	ResolveFQDNEndpoint(context.Context, *corev1.Pod, string) (fqdn.Endpoint, error)
-	BeginFQDNPolicyUpdate(context.Context) error
-	EndFQDNPolicyUpdate(context.Context, bool) error
+	BeginFQDNPolicyUpdateFor(context.Context, string, []string) error
+	EndFQDNPolicyUpdateFor(context.Context, string, bool) error
 }
 
 // FQDNPolicyHandler is shared by PE, CPE and Pod controllers. Its short-lived
@@ -37,13 +38,10 @@ type FQDNPolicyHandler struct {
 	endpoints           map[types.NamespacedName]fqdn.Endpoint
 	namespaceController *PolicyEndpointsReconciler
 	clusterController   *ClusterPolicyEndpointsReconciler
-	// A successful update in another namespace cannot reopen publication after
-	// a failed policy transaction left its namespace's static maps unproven.
-	pending map[string]bool
 }
 
 func NewFQDNPolicyHandler(k8sClient client.Client, nodeIP string, engine *fqdn.Engine, backend FQDNEndpointResolver) *FQDNPolicyHandler {
-	return &FQDNPolicyHandler{client: k8sClient, nodeIP: nodeIP, engine: engine, backend: backend, endpoints: make(map[types.NamespacedName]fqdn.Endpoint), pending: make(map[string]bool)}
+	return &FQDNPolicyHandler{client: k8sClient, nodeIP: nodeIP, engine: engine, backend: backend, endpoints: make(map[types.NamespacedName]fqdn.Endpoint)}
 }
 
 func (r *PolicyEndpointsReconciler) SetFQDNPolicyHandler(handler *FQDNPolicyHandler) {
@@ -60,31 +58,31 @@ func (r *ClusterPolicyEndpointsReconciler) SetFQDNPolicyHandler(handler *FQDNPol
 	}
 }
 
-func (h *FQDNPolicyHandler) apply(ctx context.Context, namespace string, update func() error) (err error) {
-	return h.applyWithEnrollment(ctx, namespace, true, update)
+func (h *FQDNPolicyHandler) apply(ctx context.Context, namespace, transaction string, update func() error) (err error) {
+	return h.applyWithEnrollment(ctx, namespace, transaction, true, update)
 }
 
-func (h *FQDNPolicyHandler) applyWithEnrollment(ctx context.Context, namespace string, enroll bool, update func() error) (err error) {
+func (h *FQDNPolicyHandler) applyWithEnrollment(ctx context.Context, namespace, transaction string, enroll bool, update func() error) (err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.pending[namespace] = true
-	if err = h.backend.BeginFQDNPolicyUpdate(ctx); err != nil {
+	scope, scopeErr := h.policyScope(ctx, namespace)
+	if err = h.backend.BeginFQDNPolicyUpdateFor(ctx, transaction, scope); err != nil {
 		return err
 	}
 	success := false
 	defer func() {
-		if success {
-			delete(h.pending, namespace)
-		}
-		err = errors.Join(err, h.backend.EndFQDNPolicyUpdate(ctx, success && len(h.pending) == 0))
-		if err != nil {
-			h.pending[namespace] = true
-		}
+		err = errors.Join(err, h.backend.EndFQDNPolicyUpdateFor(ctx, transaction, success))
 	}()
+	if scopeErr != nil {
+		return scopeErr
+	}
 	// Retire removed owners before changing static maps. The post-update pass
 	// also handles new pod attachments and effective CPE changes.
-	if err = h.refresh(ctx, namespace, false); err != nil {
-		return err
+	if preErr := h.refresh(ctx, namespace, false); preErr != nil {
+		// Staging already made the datapath restrictive. An old attachment
+		// can be missing precisely because this reconcile needs to repair it.
+		// Require the final refresh to prove success after static repair.
+		log().Errorf("FQDN pre-update revocation requires retry after static programming: %v", preErr)
 	}
 	if err = update(); err != nil {
 		return err
@@ -94,6 +92,34 @@ func (h *FQDNPolicyHandler) applyWithEnrollment(ctx context.Context, namespace s
 	}
 	success = true
 	return nil
+}
+
+// Include existing lifetimes (including removed pods) and potential new
+// enrollments. Backend staging tracks each transaction separately, so a failed
+// policy cannot be reopened by another transaction that shares a static map.
+func (h *FQDNPolicyHandler) policyScope(ctx context.Context, namespace string) ([]string, error) {
+	ids := make(map[string]bool)
+	for name, ep := range h.endpoints {
+		if namespace == "" || name.Namespace == namespace {
+			ids[ep.PodIdentifier] = true
+		}
+	}
+	var pods corev1.PodList
+	err := h.client.List(ctx, &pods, client.InNamespace(namespace))
+	if err == nil {
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if h.localPod(pod) {
+				ids[utils.GetPodIdentifier(pod.Name, pod.Namespace)] = true
+			}
+		}
+	}
+	result := make([]string, 0, len(ids))
+	for id := range ids {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result, err
 }
 
 // refresh runs under h.mu. A cache/read/programming failure is returned and
@@ -121,7 +147,8 @@ func (h *FQDNPolicyHandler) refresh(ctx context.Context, namespace string, enrol
 			continue
 		}
 		pod := live[name]
-		if pod == nil || string(pod.UID) != ep.UID || pod.Status.PodIP != ep.IP.String() {
+		current, alive := h.engine.Lookup(ep.IfIndex, ep.IP)
+		if pod == nil || string(pod.UID) != ep.UID || pod.Status.PodIP != ep.IP.String() || !alive || current != ep {
 			if err := h.engine.Delete(ctx, ep); err != nil {
 				result = errors.Join(result, err)
 				continue
@@ -146,11 +173,41 @@ func (h *FQDNPolicyHandler) refresh(ctx context.Context, namespace string, enrol
 			if string(pod.UID) != current.UID {
 				continue
 			} // old deletion failed
+			if enroll {
+				resolved, err := h.backend.ResolveFQDNEndpoint(ctx, pod, utils.GetPodIdentifier(pod.Name, pod.Namespace))
+				if err != nil {
+					result = errors.Join(result, err)
+					continue
+				}
+				if resolved.IfIndex != current.IfIndex || resolved.IP != current.IP {
+					// CNI repair can recreate a veth without changing pod UID/IP.
+					// Retire the old interface lifetime before binding its successor.
+					if err := h.engine.Delete(ctx, current); err != nil {
+						result = errors.Join(result, err)
+						continue
+					}
+					delete(h.endpoints, name)
+					replacement, err := h.engine.Enroll(ctx, resolved, snapshot)
+					if err != nil {
+						result = errors.Join(result, err)
+						continue
+					}
+					h.endpoints[name] = replacement
+					continue
+				}
+			}
 			// Keep the lifetime enrolled when its final domain rule disappears.
 			// Removing steering before static policy commits would expose a direct
 			// DNS bypass. An empty snapshot revokes grants and dependent flows.
 			if err := h.engine.UpdatePolicy(ctx, current, snapshot); err != nil {
-				result = errors.Join(result, fmt.Errorf("%s: %w", name, err))
+				if fqdn.IsPolicyRejected(err) {
+					// The engine committed a restrictive surviving subset. Retrying
+					// it as a failed kernel transaction would keep all selected DNS
+					// blocked even though the removed permissions were revoked.
+					log().Errorf("Rejected FQDN policy contribution for %s: %v", name, err)
+				} else {
+					result = errors.Join(result, fmt.Errorf("%s: %w", name, err))
+				}
 			}
 			continue
 		}
@@ -182,19 +239,21 @@ func (h *FQDNPolicyHandler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		// PE selectors can briefly retain a deleted pod. Retire its lifetime
 		// immediately without trying to attach probes to that stale selector.
-		return ctrl.Result{}, h.applyWithEnrollment(ctx, req.Namespace, false, func() error { return nil })
+		return ctrl.Result{}, h.applyWithEnrollment(ctx, req.Namespace, "pod/"+req.String(), false, func() error { return nil })
 	}
 	if !h.localPod(&pod) || !pod.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, h.applyWithEnrollment(ctx, req.Namespace, false, func() error { return nil })
+		return ctrl.Result{}, h.applyWithEnrollment(ctx, req.Namespace, "pod/"+req.String(), false, func() error { return nil })
 	}
-	return ctrl.Result{}, h.apply(ctx, req.Namespace, func() error {
+	// Initial enrollment also synchronizes CPEs, whose selectors can span
+	// namespaces; stage every group those shared map updates can affect.
+	return ctrl.Result{}, h.apply(ctx, "", "pod/"+req.String(), func() error {
 		// A pod may arrive after its PE. Program the observed namespace and
 		// cluster tiers before enrolling its new lifetime, including on restart.
 		if h.namespaceController == nil || h.clusterController == nil {
 			return fmt.Errorf("FQDN policy controllers are not connected")
 		}
 		var policies policyv1.PolicyEndpointList
-		if err := h.client.List(ctx, &policies, client.InNamespace(req.Namespace)); err != nil {
+		if err := h.client.List(ctx, &policies); err != nil {
 			return err
 		}
 		for i := range policies.Items {
@@ -230,11 +289,11 @@ func (h *FQDNPolicyHandler) SetupWithManager(_ context.Context, mgr ctrl.Manager
 			if !ok {
 				return false
 			}
-			if !h.localPod(before) && !h.localPod(after) {
-				return false
-			}
 			after, ok := e.ObjectNew.(*corev1.Pod)
 			if !ok {
+				return false
+			}
+			if !h.localPod(before) && !h.localPod(after) {
 				return false
 			}
 			return before.UID != after.UID || before.Status.PodIP != after.Status.PodIP || before.Status.HostIP != after.Status.HostIP ||

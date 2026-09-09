@@ -3,9 +3,10 @@
 package ebpf
 
 import (
+	"sync"
+
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
-	"sync"
 )
 
 // FQDNPrograms and this constructor exist only in explicitly tagged kernel

@@ -320,13 +320,8 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 
 #include "fqdn_ingress.h"
 
-SEC("tc_cls")
-int handle_ingress(struct __sk_buff *skb)
+static __noinline int legacy_handle_ingress(struct __sk_buff *skb)
 {
-	int fqdn_result = fqdn_handle_ingress(skb);
-	if (fqdn_result != FQDN_DEFER)
-		return fqdn_result;
-
 	struct keystruct trie_key;
 	__u32 l4_src_port = 0;
 	__u32 l4_dst_port = 0;
@@ -352,7 +347,7 @@ int handle_ingress(struct __sk_buff *skb)
 		struct iphdr *ip = data;
 		struct tcphdr *l4_tcp_hdr = data + sizeof(struct iphdr);
 		struct udphdr *l4_udp_hdr = data + sizeof(struct iphdr);
-		struct sctphdr *l4_sctp_hdr = data + sizeof(struct iphdr);
+		struct aws_sctphdr *l4_sctp_hdr = data + sizeof(struct iphdr);
 
 		if (data + sizeof(*ip) > data_end) {
 			return BPF_OK;
@@ -478,6 +473,16 @@ int handle_ingress(struct __sk_buff *skb)
 		return evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
 	}
 	return BPF_OK;
+}
+
+/* Keep the legacy and enrolled paths in separate stack frames. */
+SEC("tc_cls")
+int handle_ingress(struct __sk_buff *skb)
+{
+    int result = fqdn_handle_ingress(skb);
+    if (result != FQDN_DEFER)
+        return result;
+    return legacy_handle_ingress(skb);
 }
 
 const volatile __u32 NPA_FILE_VERSION = 3;

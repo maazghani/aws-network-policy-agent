@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"runtime"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -30,12 +32,15 @@ func (m *fqdnSDKMap) Get(k, v []byte) error {
 	return fqdnMapSyscall(m.m.MapFD, unix.BPF_MAP_LOOKUP_ELEM, k, v)
 }
 func (m *fqdnSDKMap) Put(k, v []byte) error {
-	return m.m.CreateUpdateMapEntry(uintptr(unsafe.Pointer(&k[0])), uintptr(unsafe.Pointer(&v[0])), 0)
+	err := m.m.CreateUpdateMapEntry(uintptr(unsafe.Pointer(&k[0])), uintptr(unsafe.Pointer(&v[0])), 0)
+	runtime.KeepAlive(k)
+	runtime.KeepAlive(v)
+	return err
 }
 func (m *fqdnSDKMap) Delete(k []byte) error {
 	return fqdnMapSyscall(m.m.MapFD, unix.BPF_MAP_DELETE_ELEM, k, nil)
 }
-func (m *fqdnSDKMap) Keys() ([]string, error) { return m.m.GetAllMapKeys() }
+func (m *fqdnSDKMap) Keys() ([]string, error) { return fqdnMapKeys(m.m) }
 func (m *fqdnSDKMap) ID() uint32              { return m.m.MapID }
 
 type fqdnBinding struct {
@@ -63,7 +68,9 @@ type FQDNBackend struct {
 
 var _ fqdn.Backend = (*FQDNBackend)(nil)
 
-func NewFQDNBackend(client BpfClient) (*FQDNBackend, error) {
+func NewFQDNBackend(client BpfClient) (_ *FQDNBackend, err error) {
+	started := time.Now()
+	defer func() { fqdn.Observe("recovery", started, err) }()
 	c, ok := client.(*bpfClient)
 	if !ok {
 		return nil, errors.New("FQDN backend requires native BPF client")
@@ -107,9 +114,13 @@ func fqdnBootNow() (uint64, error) {
 }
 
 type fqdnFenceContextKey struct{}
+type fqdnFenceToken struct {
+	backend *FQDNBackend
+	active  atomic.Bool
+}
 
 func (b *FQDNBackend) WithFence(ctx context.Context, fn func(context.Context) error) error {
-	if ctx.Value(fqdnFenceContextKey{}) == b {
+	if token, ok := ctx.Value(fqdnFenceContextKey{}).(*fqdnFenceToken); ok && token.backend == b && token.active.Load() {
 		return fn(ctx)
 	}
 	select {
@@ -121,7 +132,10 @@ func (b *FQDNBackend) WithFence(ctx context.Context, fn func(context.Context) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return fn(context.WithValue(ctx, fqdnFenceContextKey{}, b))
+	token := &fqdnFenceToken{backend: b}
+	token.active.Store(true)
+	defer token.active.Store(false)
+	return fn(context.WithValue(ctx, fqdnFenceContextKey{}, token))
 }
 func (b *FQDNBackend) reset() error {
 	zero := fqdnProxyValue{}
@@ -229,7 +243,9 @@ func (b *FQDNBackend) ReconcilePolicy(ctx context.Context, ep fqdn.Endpoint, pol
 	s.policy = policy
 	return nil
 }
-func (b *FQDNBackend) Replace(ctx context.Context, ep fqdn.Endpoint, revision uint64, grants []fqdn.Grant) error {
+func (b *FQDNBackend) Replace(ctx context.Context, ep fqdn.Endpoint, revision uint64, grants []fqdn.Grant) (err error) {
+	started := time.Now()
+	defer func() { fqdn.Observe("programming", started, err) }()
 	s, err := b.binding(ep)
 	if err != nil {
 		return err
@@ -243,8 +259,10 @@ func (b *FQDNBackend) Replace(ctx context.Context, ep fqdn.Endpoint, revision ui
 	if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
 		return fmt.Errorf("invalidate before replacement: %w", err)
 	}
-	if err = b.reconcileFlows(ctx, s, revision); err != nil {
-		return err
+	if flowProofChanges(s, revision, grants) {
+		if err = b.reconcileFlows(ctx, s, revision); err != nil {
+			return err
+		}
 	}
 	desired := map[fqdnGrantKey]fqdnGrantValue{}
 	counts := map[fqdnGrantKey]int{}
@@ -319,6 +337,7 @@ func (b *FQDNBackend) Check(ctx context.Context, ep fqdn.Endpoint, revision uint
 		return err
 	}
 	addresses := map[netip.Addr]bool{}
+	live := map[netip.Addr]bool{}
 	for _, g := range grants {
 		if _, ok := addresses[g.Address]; !ok {
 			addresses[g.Address] = false
@@ -329,6 +348,7 @@ func (b *FQDNBackend) Check(ctx context.Context, ep fqdn.Endpoint, revision uint
 		if g.Deadline <= now {
 			continue
 		}
+		live[g.Address] = true
 		k := fqdnGrantKey{Lifetime: ep.Lifetime, Generation: revision, Address: fqdnAddress(g.Address)}
 		var active fqdnGrantValue
 		if err = b.maps["fqdn_grants"].Get(fqdnBytes(&k), fqdnBytes(&active)); err != nil {
@@ -350,8 +370,11 @@ func (b *FQDNBackend) Check(ctx context.Context, ep fqdn.Endpoint, revision uint
 		}
 		addresses[g.Address] = addresses[g.Address] || admitted
 	}
-	for _, allowed := range addresses {
+	for address, allowed := range addresses {
 		if !allowed {
+			if !live[address] {
+				return fqdn.ErrExpired
+			}
 			return fqdn.ErrNoPermission
 		}
 	}
@@ -360,7 +383,7 @@ func (b *FQDNBackend) Check(ctx context.Context, ep fqdn.Endpoint, revision uint
 func (b *FQDNBackend) Delete(ctx context.Context, ep fqdn.Endpoint) error {
 	s, err := b.binding(ep)
 	if err != nil {
-		return err
+		return b.deleteRetiredLifetime(ctx, ep)
 	}
 	v := fqdnEndpointValue{Lifetime: ep.Lifetime, Generation: s.revision, Address: fqdnAddress(ep.IP), Family: fqdnFamily(ep.IP), Flags: fqdnEndpointSelected}
 	if err = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
@@ -391,7 +414,7 @@ func (b *FQDNBackend) Delete(ctx context.Context, ep fqdn.Endpoint) error {
 }
 func (b *FQDNBackend) SetProxyReady(ctx context.Context, port, mark uint32, ready bool) error {
 	return b.WithFence(ctx, func(context.Context) error {
-		v := fqdnProxyValue{Port: port, Mark: mark, ReplyMark: 0x40000000}
+		v := fqdnProxyValue{Port: port, Mark: mark, ReplyMark: fqdn.DNSReplyMark}
 		if ready {
 			if port == 0 || port > 65535 || mark == 0 {
 				return errors.New("invalid FQDN proxy configuration")
@@ -417,11 +440,23 @@ func (b *FQDNBackend) LookupDNSIdentity(ctx context.Context, source, destination
 			return fqdn.ErrEndpoint
 		}
 		ep = s.endpoint
-		return b.verify(ctx, ep)
+		if err := b.Check(ctx, ep, s.revision, nil); err != nil {
+			return err
+		}
+		policy, err := b.loadStaticPolicy(ep, destination.Addr().Unmap())
+		if err != nil {
+			return err
+		}
+		if !policy.verdict(protocol, destination.Port(), false) {
+			return fqdn.ErrNoPermission
+		}
+		return nil
 	})
 	return
 }
-func (b *FQDNBackend) verifyAttachment(ctx context.Context, ep fqdn.Endpoint) error {
+func (b *FQDNBackend) verifyAttachment(ctx context.Context, ep fqdn.Endpoint) (err error) {
+	started := time.Now()
+	defer func() { fqdn.Observe("attachment", started, err) }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -467,9 +502,9 @@ func (b *FQDNBackend) verifyAttachment(ctx context.Context, ep fqdn.Endpoint) er
 		if err != nil {
 			return err
 		}
-		required := []string{"fqdn_endpoints", "fqdn_flows", "fqdn_dns"}
+		required := []string{"fqdn_endpoints", "fqdn_flows", "fqdn_dns", "fqdn_proxy"}
 		if direction.parent == netlink.HANDLE_MIN_INGRESS {
-			required = append(required, "fqdn_grants", "fqdn_proxy")
+			required = append(required, "fqdn_grants")
 		}
 		static := pe.egressPgmInfo.Maps
 		staticNames := []string{utils.TC_EGRESS_MAP, utils.TC_CLUSTER_POLICY_EGRESS_MAP, utils.TC_EGRESS_POD_STATE_MAP}

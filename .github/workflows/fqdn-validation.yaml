@@ -2,7 +2,7 @@ name: FQDN kernel qualification
 
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
     paths: ['pkg/fqdn/**', 'pkg/ebpf/**', 'test/fqdn/**', 'scripts/fqdn*', '.github/workflows/fqdn-validation.yaml', 'go.mod', 'go.sum']
   pull_request:
     paths: ['pkg/fqdn/**', 'pkg/ebpf/**', 'test/fqdn/**', 'scripts/fqdn*', '.github/workflows/fqdn-validation.yaml', 'go.mod', 'go.sum']
@@ -23,10 +23,10 @@ jobs:
       - name: Install kernel test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic iproute2
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic iproute2 iptables
           # Ubuntu's bpftool wrapper may demand a package matching the hosted
           # kernel. Select the packaged executable directly when available.
-          bpftool_binary=$(find /usr/lib/linux-tools -type f -name bpftool | sort | tail -n 1)
+          bpftool_binary=$(find -L /usr/lib/linux-tools -type f -name bpftool | sort | tail -n 1)
           test -n "$bpftool_binary"
           sudo ln -sf "$bpftool_binary" /usr/local/bin/bpftool
       - name: Record qualification environment
@@ -35,6 +35,8 @@ jobs:
           { uname -a; go version; clang --version; ip -Version; sudo bpftool feature probe kernel; } > test-results/environment.txt 2>&1
       - name: Unit tests and parser fuzz seeds
         run: go test -race ./pkg/fqdn/... ./pkg/ebpf/... | tee test-results/unit.txt
+      - name: Userspace microbenchmarks (kernel I/O excluded)
+        run: go test ./test/fqdn -run '^$' -bench . -benchtime=200ms -benchmem | tee test-results/microbenchmarks.txt
       - name: Real TC and socket assignment, IPv4 and IPv6
         run: |
           set -o pipefail

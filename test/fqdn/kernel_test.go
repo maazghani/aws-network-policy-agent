@@ -43,6 +43,9 @@ type fixture struct {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("FQDN_TEST_HELPER") == "dns" {
+		os.Exit(probeDNS())
+	}
 	if os.Getenv("FQDN_TEST_HELPER") == "server" {
 		os.Exit(serveEcho())
 	}
@@ -64,6 +67,9 @@ func TestKernelPrerequisites(t *testing.T) {
 	}
 	if caps[0].Effective&(1<<unix.CAP_NET_ADMIN) == 0 {
 		t.Fatal("missing CAP_NET_ADMIN")
+	}
+	if caps[0].Effective&(1<<unix.CAP_NET_RAW) == 0 {
+		t.Fatal("missing CAP_NET_RAW for NodeLocal-compatible UDP replies")
 	}
 	if caps[0].Effective&(1<<unix.CAP_SYS_ADMIN) == 0 {
 		t.Fatal("missing CAP_SYS_ADMIN for isolated qualification")
@@ -357,7 +363,7 @@ func serveEcho() int {
 			if err != nil {
 				return
 			}
-			_, _ = udp.WriteTo(b[:n], peer)
+			_, _ = udp.WriteTo(dnsFixtureAnswer(b[:n], true), peer)
 		}
 	}()
 	fmt.Println("READY")
@@ -366,7 +372,7 @@ func serveEcho() int {
 		if err != nil {
 			return 1
 		}
-		go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
+		go func() { defer c.Close(); serveDNSOrEchoTCP(c) }()
 	}
 }
 
@@ -376,7 +382,10 @@ func (f *fixture) startResolver(namespace string) {
 		f.t.Fatal(err)
 	}
 	cmd := exec.Command("ip", "netns", "exec", namespace, exe)
-	cmd.Env = append(os.Environ(), "FQDN_TEST_HELPER=server", "FQDN_PROBE_ADDRESS="+net.JoinHostPort(f.resolver.String(), "53"))
+	if namespace == "" {
+		cmd = exec.Command(exe)
+	}
+	cmd.Env = append(os.Environ(), "FQDN_TEST_HELPER=server", "FQDN_PROBE_ADDRESS="+net.JoinHostPort(f.resolver.String(), "53"), "FQDN_DNS_ANSWER="+f.target.String())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		f.t.Fatal(err)
@@ -413,7 +422,11 @@ func probe() int {
 		count = 1
 	}
 	defer func() { _ = json.NewEncoder(os.Stdout).Encode(result) }()
-	c, err := net.DialTimeout(network, destination, 750*time.Millisecond)
+	dialer := net.Dialer{Timeout: 750 * time.Millisecond}
+	if strings.HasPrefix(network, "udp") {
+		dialer.LocalAddr = &net.UDPAddr{Port: 32053}
+	}
+	c, err := dialer.Dial(network, destination)
 	if err != nil {
 		result.Error = err.Error()
 		return 0

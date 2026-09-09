@@ -2,6 +2,9 @@
 #define AWS_NPA_FQDN_PACKET_H
 #include <bpf/bpf_endian.h>
 #include "fqdn.h"
+/* SCTP may be a module and absent from generated vmlinux BTF. This wire
+ * header is protocol-defined and never depends on kernel structure layout. */
+struct aws_sctphdr { __be16 source, dest; __be32 vtag, checksum; };
 struct fqdn_packet {
     struct fqdn_tuple tuple;
     __u32 sequence;
@@ -135,7 +138,7 @@ static __noinline int fqdn_parse(struct __sk_buff *skb, struct fqdn_packet *p)
         p->tuple.sport = bpf_ntohs(udp->source);
         p->tuple.dport = bpf_ntohs(udp->dest);
     } else if (p->tuple.protocol == IPPROTO_SCTP) {
-        struct sctphdr *sctp = l4;
+        struct aws_sctphdr *sctp = l4;
         if ((void *)(sctp + 1) > end || transport_len < sizeof(*sctp))
             return -1;
         p->tuple.sport = bpf_ntohs(sctp->source);

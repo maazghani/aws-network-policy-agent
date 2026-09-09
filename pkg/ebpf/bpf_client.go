@@ -197,6 +197,11 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		//Log the error and move on
 		log().Errorf("Probe validation/update failed but will continue to load %v", err)
 	}
+	if ingressUpdateRequired || egressUpdateRequired || eventsUpdateRequired {
+		if err := guardFQDNUpgrade(); err != nil {
+			return nil, err
+		}
+	}
 	log().Info("Probe validation Done")
 
 	//Copy the latest binaries to /opt/cni/bin
@@ -747,6 +752,12 @@ func (l *bpfClient) attacheBPFProbesUnfenced(pod types.NamespacedName, podIdenti
 	log().Debugf("Got the podIdentifierLock for Pod: %s, Namespace: %s, PodIdentifier: %s", pod.Name, pod.Namespace, podIdentifier)
 	defer podIdentifierLock.Unlock()
 
+	// A name cache does not prove a live veth lifetime after a lost CNI DEL.
+	if l.fqdn != nil {
+		if err := l.fqdn.checkCachedAttachment(pod.Namespace, pod.Name); err != nil {
+			return err
+		}
+	}
 	// Check if an eBPF probe is already attached on both ingress and egress direction(s) for this pod.
 	// If yes, then skip probe attach flow for this pod.
 	isIngressProbeAttached, isEgressProbeAttached := l.isEBPFProbeAttached(pod.Name, pod.Namespace)

@@ -3,6 +3,7 @@ package fqdn
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net/netip"
 	"testing"
@@ -161,6 +162,33 @@ func TestDNSRecordAndCNAMELimits(t *testing.T) {
 	}
 	if _, err := ParseDNSAnswer(q, make([]byte, maxDNSMessage+1), 1, 4); err == nil {
 		t.Fatal("oversized message accepted")
+	}
+	var chain []dnsmessage.Resource
+	for i := 0; i <= maxCNAMEHops; i++ {
+		chain = append(chain, dnsTestCNAME(fmt.Sprintf("c%d.example.", i), fmt.Sprintf("c%d.example.", i+1), 10))
+	}
+	q, r = dnsTestExchange(t, "c0.example.", dnsmessage.TypeA, chain, nil)
+	if _, err := ParseDNSAnswer(q, r, 1, 4); err == nil {
+		t.Fatal("excessive CNAME chain accepted")
+	}
+}
+
+func TestDNSReachableAdditionalRecordsRequireAdmission(t *testing.T) {
+	q, r := dnsTestExchange(t, "allowed.example.", dnsmessage.TypeA, []dnsmessage.Resource{dnsTestCNAME("allowed.example.", "edge.example.", 10)}, []dnsmessage.Resource{dnsTestA("edge.example.", 30, [4]byte{1, 2, 3, 4}), dnsTestA("unrelated.example.", 30, [4]byte{9, 9, 9, 9})})
+	answer, err := ParseDNSAnswer(q, r, 1, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answer.Observations) != 1 || answer.Observations[0].Address != netip.MustParseAddr("1.2.3.4") {
+		t.Fatalf("additional reachability: %+v", answer.Observations)
+	}
+	wire, err := answer.Pack([]uint32{4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _ := unpackDNS(wire)
+	if message.Additionals[0].Header.TTL != 4 || message.Answers[0].Header.TTL != 4 || message.Additionals[1].Header.TTL != 30 {
+		t.Fatal("supporting additional TTL not clamped independently")
 	}
 }
 

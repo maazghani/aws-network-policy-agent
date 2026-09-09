@@ -86,6 +86,31 @@ func NewProxy(engine *Engine, bridge DNSBridge, config ProxyConfig) (*Proxy, err
 }
 
 func (p *Proxy) Ready() bool { return p.ready.Load() }
+
+// Reconcile restores exclusively owned host rules while keeping established DNS
+// sockets open. The forwarding guard blocks selected DNS during a missing-route
+// repair. Conflicts or repair failures withdraw readiness and require Start to
+// repeat the complete checked setup; they never fall back to direct forwarding.
+func (p *Proxy) Reconcile(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cancel == nil || !p.ready.Load() {
+		return errors.New("DNS proxy is not running")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	steering, err := installDNSSteering(p.config.Family, p.config.Mark, p.config.RouteTable, p.config.RulePriority)
+	if err == nil {
+		p.steering = steering
+		return nil
+	}
+	p.ready.Store(false)
+	bounded, cancel := context.WithTimeout(context.Background(), p.config.ExchangeTimeout)
+	defer cancel()
+	return errors.Join(err, p.bridge.SetProxyReady(bounded, uint32(p.config.Port), p.config.Mark, false))
+}
+
 func (p *Proxy) Stats() ProxyStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -118,6 +143,16 @@ func (p *Proxy) Start(parent context.Context) error {
 		_ = steering.close()
 		return err
 	}
+	// NodeLocal DNSCache can exclusively own resolverIP:53. Raw UDP replies
+	// avoid that bind conflict; verify the required capability before readiness.
+	replyFD, err := openDNSReplySocket(p.config.Family)
+	if err != nil {
+		_ = tcp.Close()
+		_ = udp.Close()
+		_ = steering.close()
+		return err
+	}
+	_ = unix.Close(replyFD)
 	if err = p.bridge.SetProxyReady(parent, uint32(p.config.Port), p.config.Mark, true); err != nil {
 		_ = tcp.Close()
 		_ = udp.Close()
@@ -238,6 +273,11 @@ func (p *Proxy) serveUDP(ctx context.Context, listener *net.UDPConn) {
 			}
 			response, err := p.exchangeUDP(exchange, destination, request)
 			write := func(c context.Context, wire []byte) error {
+				var err error
+				wire, err = fitDNSUDP(request, wire)
+				if err != nil {
+					return err
+				}
 				return sendTransparentUDP(c, p.config.Family, destination, source, wire)
 			}
 			if err == nil {
@@ -292,6 +332,13 @@ func (p *Proxy) exchangeUDP(ctx context.Context, destination netip.AddrPort, req
 func (p *Proxy) publish(ctx context.Context, ep Endpoint, source, destination netip.AddrPort, protocol uint8, request, response []byte, write func(context.Context, []byte) error) (retErr error) {
 	started := time.Now()
 	defer func() { Observe("publish", started, retErr) }()
+	if protocol == 17 {
+		var err error
+		response, err = fitDNSUDP(request, response)
+		if err != nil {
+			return err
+		}
+	}
 	now, err := (BootClock{}).Now()
 	if err != nil {
 		return err

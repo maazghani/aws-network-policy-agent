@@ -5,12 +5,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/vishvananda/netlink"
+	"os"
 	"time"
+	"unsafe"
 
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
 	"github.com/aws/aws-network-policy-agent/pkg/fqdn"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -24,7 +26,7 @@ func (b *FQDNBackend) invalidateLegacyConntrack(ep fqdn.Endpoint) error {
 	if !ok {
 		return errors.New("invalid conntrack map")
 	}
-	keys, err := m.GetAllMapKeys()
+	keys, err := fqdnMapKeys(m)
 	if err != nil {
 		return err
 	}
@@ -128,6 +130,10 @@ func (b *FQDNBackend) gc(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	owners := map[uint64]*fqdnBinding{}
+	for _, s := range b.bound {
+		owners[s.endpoint.Lifetime] = s
+	}
 	for _, name := range []string{"fqdn_dns", "fqdn_flows"} {
 		keys, err := b.maps[name].Keys()
 		if err != nil {
@@ -161,6 +167,13 @@ func (b *FQDNBackend) gc(ctx context.Context) error {
 				if err := b.maps[name].Delete([]byte(key)); err != nil && !errors.Is(err, unix.ENOENT) {
 					return err
 				}
+				if name == "fqdn_flows" {
+					var fk fqdnFlowKey
+					copy(fqdnBytes(&fk), key)
+					if owner := owners[fk.Lifetime]; owner != nil {
+						delete(owner.flowNames, fk)
+					}
+				}
 			}
 		}
 	}
@@ -193,4 +206,102 @@ func (b *FQDNBackend) gc(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (b *FQDNBackend) checkCachedAttachment(namespace, name string) error {
+	for _, s := range b.bound {
+		if s.endpoint.Namespace != namespace || s.endpoint.Name != name {
+			continue
+		}
+		if err := b.verify(context.Background(), s.endpoint); err == nil {
+			continue
+		}
+		if err := b.Delete(context.Background(), s.endpoint); err != nil {
+			return err
+		}
+		b.client.deletePodFromIngressProgPodCaches(name, namespace)
+		b.client.deletePodFromEgressProgPodCaches(name, namespace)
+	}
+	return nil
+}
+
+// Existing static upgrades detach filters before replacing them. Selected FQDN
+// workloads must therefore be drained before this legacy upgrade path runs.
+// Refuse before detach, preserving the old restrictive datapath and deadlines.
+func guardFQDNUpgrade() error {
+	path := "/sys/fs/bpf/globals/aws/maps/global_fqdn_endpoints"
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	api := goebpfmaps.BpfMap{}
+	info, err := api.GetMapFromPinPath(path)
+	if err != nil {
+		return err
+	}
+	if info.KeySize != 4 || info.ValueSize != 40 {
+		return errors.New("cannot verify old FQDN endpoint ABI; drain selected workloads before upgrade")
+	}
+	key := uint32(0)
+	err = goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&key)), int(info.Id))
+	for scanned := uint32(0); err == nil; scanned++ {
+		if scanned > info.MaxEntries {
+			return errors.New("FQDN endpoint churn prevented bounded upgrade validation")
+		}
+		var value fqdnEndpointValue
+		if err := goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)), int(info.Id)); err != nil {
+			return err
+		}
+		if value.Flags&fqdnEndpointSelected != 0 {
+			if _, err := netlink.LinkByIndex(int(key)); err == nil {
+				return errors.New("FQDN-selected endpoints remain: drain or replace this node before changing BPF binaries")
+			} else {
+				var absent netlink.LinkNotFoundError
+				if !errors.As(err, &absent) {
+					return err
+				}
+			}
+		}
+		next := uint32(0)
+		err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&next)), int(info.Id))
+		key = next
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	return nil
+}
+
+// Delete may be retried after CNI already retired the backend binding. Kernel
+// lifetime comparison makes the retry idempotent without touching a successor.
+func (b *FQDNBackend) deleteRetiredLifetime(ctx context.Context, ep fqdn.Endpoint) error {
+	var v fqdnEndpointValue
+	err := b.maps["fqdn_endpoints"].Get(fqdnUint32(ep.IfIndex), fqdnBytes(&v))
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if v.Lifetime != ep.Lifetime {
+		return nil
+	}
+	v.Flags = fqdnEndpointSelected
+	if err := b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&v)); err != nil {
+		return err
+	}
+	for _, name := range []string{"fqdn_grants", "fqdn_flows"} {
+		if err := b.clearMap(name, func(key []byte) bool { return len(key) >= 8 && binary.NativeEndian.Uint64(key[:8]) == ep.Lifetime }); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func (b *FQDNBackend) BeginFQDNPolicyUpdateFor(ctx context.Context, transaction string, podIdentifiers []string) error {
+	return b.BeginFQDNPolicyUpdate(ctx)
+}
+func (b *FQDNBackend) EndFQDNPolicyUpdateFor(ctx context.Context, transaction string, success bool) error {
+	return b.EndFQDNPolicyUpdate(ctx, success)
 }

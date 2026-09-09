@@ -17,22 +17,23 @@ if [[ ${1:-} == --isolated ]]; then
 fi
 
 if [[ $EUID != 0 ]]; then
-    echo 'FQDN kernel qualification requires root with CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_BPF and CAP_PERFMON (or older-kernel CAP_SYS_ADMIN). Run on a disposable privileged Linux host.' >&2
+    echo 'FQDN kernel qualification requires root with CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF and CAP_PERFMON (or older-kernel CAP_SYS_ADMIN). Run on a disposable privileged Linux host.' >&2
     exit 1
 fi
-for command in go clang ip mount unshare python3; do
-    command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
-done
+command -v python3 >/dev/null || { echo 'Missing prerequisite: python3' >&2; exit 1; }
 python3 - <<'PY'
 import re, sys
 status = open('/proc/self/status').read()
 caps = int(re.search(r'^CapEff:\s*(\w+)', status, re.M)[1], 16)
-missing = [name for bit, name in [(12, 'CAP_NET_ADMIN'), (21, 'CAP_SYS_ADMIN')]
+missing = [name for bit, name in [(12, 'CAP_NET_ADMIN'), (13, 'CAP_NET_RAW'), (21, 'CAP_SYS_ADMIN')]
            if not caps & (1 << bit)]
 if missing:
     sys.exit('Cannot qualify FQDN datapath: missing ' + ', '.join(missing) +
              '; uid 0 alone is insufficient. No tests were skipped or passed.')
 PY
+for command in go clang ip iptables ip6tables mount unshare; do
+    command -v "$command" >/dev/null || { echo "Missing prerequisite: $command" >&2; exit 1; }
+done
 
 if [[ ! -s pkg/ebpf/c/vmlinux.h ]]; then
     command -v bpftool >/dev/null || { echo 'bpftool is required to generate vmlinux.h' >&2; exit 1; }

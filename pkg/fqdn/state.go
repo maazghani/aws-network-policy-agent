@@ -32,8 +32,10 @@ type endpointState struct {
 	life     context.Context
 	cancel   context.CancelFunc
 	alive    bool
+	counted  bool
 	updating int
 	blocked  bool
+	dirty    bool
 }
 
 type Engine struct {
@@ -167,6 +169,7 @@ func (e *Engine) Enroll(ctx context.Context, ep Endpoint, initial ...Snapshot) (
 	}
 	e.mu.Lock()
 	s.alive = true
+	s.counted = true
 	e.totalRules += len(s.policy.Rules)
 	e.mu.Unlock()
 	return ep, nil
@@ -178,7 +181,6 @@ func (e *Engine) remove(s *endpointState) {
 	if e.endpoints[s.endpoint.Lifetime] != s {
 		return
 	}
-	wasAlive := s.alive
 	s.alive = false
 	s.cancel()
 	delete(e.endpoints, s.endpoint.Lifetime)
@@ -187,7 +189,7 @@ func (e *Engine) remove(s *endpointState) {
 	}
 	e.totalObservations -= len(s.observations)
 	e.totalGrants -= len(s.grants)
-	if wasAlive {
+	if s.counted {
 		e.totalRules -= len(s.policy.Rules)
 	}
 	e.totalAddresses -= addressCount(s.grants)
@@ -205,9 +207,6 @@ func (e *Engine) Delete(ctx context.Context, ep Endpoint) (err error) {
 	if s == nil || s.endpoint != ep {
 		e.mu.Unlock()
 		return ErrEndpoint
-	}
-	if s.alive {
-		e.totalRules -= len(s.policy.Rules)
 	}
 	s.alive = false
 	s.cancel()
@@ -306,7 +305,8 @@ func (e *Engine) UpdatePolicy(ctx context.Context, ep Endpoint, snapshot Snapsho
 	if _, err = e.find(ep); err != nil {
 		return err
 	}
-	rules, policyErr := e.compile(snapshot.Rules, s.policy.Rules)
+	previousRules := s.policy.Rules
+	rules, policyErr := e.compile(snapshot.Rules, previousRules)
 	revision := s.policy.Revision + 1
 	if snapshot.Revision > revision {
 		revision = snapshot.Revision
@@ -334,14 +334,34 @@ func (e *Engine) UpdatePolicy(ctx context.Context, ep Endpoint, snapshot Snapsho
 		}
 	}
 	grants, grantErr := e.grants(rules, observations, now)
+	retainSurvivors := func() {
+		var surviving []Rule
+		for _, old := range previousRules {
+			for _, current := range rules {
+				if sameRule(old, current) {
+					surviving = append(surviving, old)
+					break
+				}
+			}
+		}
+		e.mu.Lock()
+		e.totalRules += len(surviving) - len(s.policy.Rules)
+		s.policy.Rules = surviving
+		e.mu.Unlock()
+		rules = surviving
+		for key, o := range observations {
+			if len(matching(rules, o.Name)) == 0 {
+				delete(observations, key)
+			}
+		}
+		grants, _ = e.grants(rules, observations, now)
+	}
 	if grantErr != nil {
-		observations = make(map[observationKey]Observation)
-		grants = nil
+		retainSurvivors()
 		policyErr = errors.Join(policyErr, grantErr)
 	}
 	if reserveErr := e.reserve(s, observations, grants); reserveErr != nil {
-		observations = make(map[observationKey]Observation)
-		grants = nil
+		retainSurvivors()
 		_ = e.reserve(s, observations, grants)
 		policyErr = errors.Join(policyErr, reserveErr)
 	}
@@ -357,6 +377,9 @@ func (e *Engine) UpdatePolicy(ctx context.Context, ep Endpoint, snapshot Snapsho
 		return e.backend.Replace(ctx, ep, revision, grants)
 	})
 	s.blocked = err != nil
+	if err == nil {
+		s.dirty = false
+	}
 	if err != nil {
 		// Do not retain a failed policy as usable authority. Deletion failure is
 		// surfaced alongside the original failure, never reported as revocation.
@@ -369,6 +392,9 @@ func (e *Engine) UpdatePolicy(ctx context.Context, ep Endpoint, snapshot Snapsho
 	s.life, s.cancel = context.WithCancel(context.Background())
 	e.mu.Unlock()
 	e.revocations.Add(1)
+	if err == nil && policyErr != nil {
+		return &RejectedPolicyError{Cause: policyErr}
+	}
 	return errors.Join(policyErr, err)
 }
 
@@ -539,7 +565,7 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 			return ErrNoPermission
 		}
 		if o.ExpiresAt <= now {
-			return ErrExpired
+			continue
 		}
 		o.Name = name
 		key := observationKey{name, o.Address}
@@ -549,13 +575,16 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 	}
 	grants, err := e.grants(s.policy.Rules, observations, now)
 	if err != nil {
+		if errors.Is(err, ErrCapacity) {
+			return e.publishStatic(ctx, s, answer, matched, releaseResponse, err)
+		}
 		return err
 	}
 	oldObservations, oldGrants := s.observations, s.grants
 	if err = e.reserve(s, observations, grants); err != nil {
 		e.reclaimOthers(ctx, s)
 		if err = e.reserve(s, observations, grants); err != nil {
-			return err
+			return e.publishStatic(ctx, s, answer, matched, releaseResponse, err)
 		}
 	}
 	programmed := false
@@ -564,8 +593,10 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 			return err
 		}
 		if err := e.backend.Replace(ctx, ep, s.policy.Revision, grants); err != nil {
+			s.dirty = true
 			return err
 		}
+		s.dirty = false
 		programmed = true
 		// Check the full answer set, including duplicate responses. A previous
 		// write does not prove attachment or current tier-effective permission.
@@ -579,7 +610,12 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 			}
 		}
 		if err := e.backend.Check(ctx, ep, s.policy.Revision, required); err != nil {
-			return err
+			if !errors.Is(err, ErrExpired) {
+				return err
+			}
+			if staticErr := e.checkStatic(ctx, s, answer); staticErr != nil {
+				return errors.Join(err, staticErr)
+			}
 		}
 		if _, err := e.find(ep); err != nil {
 			return err
@@ -591,11 +627,29 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 		if err != nil {
 			return err
 		}
+		var unsupported []Observation
+		for _, o := range answer {
+			live := false
+			for _, g := range required {
+				if g.Address == o.Address && g.Deadline > now {
+					live = true
+					break
+				}
+			}
+			if !live {
+				unsupported = append(unsupported, o)
+			}
+		}
+		if len(unsupported) > 0 {
+			if err := e.checkStatic(ctx, s, unsupported); err != nil {
+				return errors.Join(ErrExpired, err)
+			}
+		}
 		ttls := make([]uint32, len(answer))
 		remainingDeadline := e.config.PublicationTimeout
 		for i, o := range answer {
 			if o.ExpiresAt <= now {
-				return ErrExpired
+				continue
 			}
 			remaining := (o.ExpiresAt - now) / uint64(time.Second)
 			if remaining > uint64(^uint32(0)) {
@@ -618,6 +672,59 @@ func (e *Engine) publish(ctx context.Context, ep Endpoint, question string, answ
 		_ = e.reserve(s, oldObservations, oldGrants)
 	}
 	return err
+}
+
+func (e *Engine) checkStatic(ctx context.Context, s *endpointState, answer []Observation) error {
+	backend, ok := e.backend.(StaticBackend)
+	if !ok {
+		return ErrNoPermission
+	}
+	entries := make(map[grantKey]Grant)
+	for _, o := range answer {
+		for _, rule := range matching(s.policy.Rules, o.Name) {
+			for _, port := range rule.Ports {
+				key := grantKey{o.Address, port}
+				entries[key] = Grant{Address: o.Address, Protocol: port.Protocol, StartPort: port.StartPort, EndPort: port.EndPort}
+				if len(entries) > e.config.Limits.MaxGrantsPerEndpoint {
+					return ErrCapacity
+				}
+			}
+		}
+	}
+	grants := make([]Grant, 0, len(entries))
+	for _, g := range entries {
+		grants = append(grants, g)
+	}
+	return backend.CheckStatic(ctx, s.endpoint, grants)
+}
+
+func (e *Engine) publishStatic(ctx context.Context, s *endpointState, answer []Observation, matched bool, write func(context.Context, bool, []uint32) error, cause error) error {
+	return e.backend.WithFence(ctx, func(ctx context.Context) error {
+		if err := e.checkStatic(ctx, s, answer); err != nil {
+			return errors.Join(cause, err)
+		}
+		if _, err := e.find(s.endpoint); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		now, err := e.config.Clock.Now()
+		if err != nil {
+			return err
+		}
+		ttls := make([]uint32, len(answer))
+		for i, o := range answer {
+			if o.ExpiresAt > now {
+				ttls[i] = uint32(min((o.ExpiresAt-now)/uint64(time.Second), uint64(^uint32(0))))
+			}
+		}
+		if err := write(ctx, matched, ttls); err != nil {
+			return err
+		}
+		e.admissions.Add(1)
+		return nil
+	})
 }
 
 func addressCount(grants []Grant) int {
@@ -671,6 +778,9 @@ func (e *Engine) expireLocked(ctx context.Context, s *endpointState) error {
 	if _, err := e.find(s.endpoint); err != nil {
 		return nil
 	}
+	if s.blocked {
+		return nil
+	}
 	now, err := e.config.Clock.Now()
 	if err != nil {
 		return err
@@ -681,7 +791,7 @@ func (e *Engine) expireLocked(ctx context.Context, s *endpointState) error {
 			observations[k] = o
 		}
 	}
-	if len(observations) == len(s.observations) {
+	if len(observations) == len(s.observations) && !s.dirty {
 		return nil
 	}
 	grants, err := e.grants(s.policy.Rules, observations, now)
@@ -689,8 +799,10 @@ func (e *Engine) expireLocked(ctx context.Context, s *endpointState) error {
 		return err
 	}
 	if err = e.backend.WithFence(ctx, func(ctx context.Context) error { return e.backend.Replace(ctx, s.endpoint, s.policy.Revision, grants) }); err != nil {
+		s.dirty = true
 		return err
 	}
+	s.dirty = false
 	e.expired.Add(uint64(len(s.observations) - len(observations)))
 	return e.reserve(s, observations, grants)
 }

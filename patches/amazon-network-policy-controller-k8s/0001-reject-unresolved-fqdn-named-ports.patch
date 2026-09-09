@@ -1,9 +1,9 @@
 diff --git a/pkg/resolvers/applicationnetworkpolicy_namedports_test.go b/pkg/resolvers/applicationnetworkpolicy_namedports_test.go
 new file mode 100644
-index 0000000..e40114f
+index 0000000..db0a313
 --- /dev/null
 +++ b/pkg/resolvers/applicationnetworkpolicy_namedports_test.go
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,68 @@
 +package resolvers
 +
 +import (
@@ -72,7 +72,6 @@ index 0000000..e40114f
 +	require.Equal(t, []networking.PolicyType{networking.PolicyTypeEgress}, policy.Spec.PolicyTypes)
 +	require.Equal(t, policy.Spec.PolicyTypes, r.convertApplicationNetworkPolicyToNetworkPolicyWithNoEgress(policy).Spec.PolicyTypes)
 +}
-+
 diff --git a/pkg/resolvers/applicationnetworkpolicy_resolver.go b/pkg/resolvers/applicationnetworkpolicy_resolver.go
 index 56f9cf9..0cb480f 100644
 --- a/pkg/resolvers/applicationnetworkpolicy_resolver.go

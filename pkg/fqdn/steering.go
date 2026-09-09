@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
@@ -122,28 +121,58 @@ func originalDestination(oob []byte, family int) (netip.AddrPort, error) {
 }
 
 func sendTransparentUDP(ctx context.Context, family int, source, destination netip.AddrPort, response []byte) error {
-	suffix, _, err := listenerAddress(family, 0)
+	packet, err := dnsUDPReplyPacket(source, destination, response)
 	if err != nil {
 		return err
 	}
-	lc := net.ListenConfig{Control: transparentControl(family, false)}
-	conn, err := lc.ListenPacket(ctx, "udp"+suffix, source.String())
+	fd, err := openDNSReplySocket(family)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetWriteDeadline(deadline); err != nil {
-			return err
+	defer unix.Close(fd)
+	var address unix.Sockaddr
+	if family == 4 {
+		address = &unix.SockaddrInet4{Addr: destination.Addr().As4()}
+	} else {
+		address = &unix.SockaddrInet6{Addr: destination.Addr().As16()}
+	}
+	// The descriptor is nonblocking. A full kernel queue fails this publication
+	// instead of extending the fence or holding an unbounded sender goroutine.
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	return unix.Sendto(fd, packet, unix.MSG_DONTWAIT, address)
+}
+
+func openDNSReplySocket(family int) (int, error) {
+	af := unix.AF_INET
+	if family == 6 {
+		af = unix.AF_INET6
+	} else if family != 4 {
+		return -1, errors.New("invalid DNS reply family")
+	}
+	fd, err := unix.Socket(af, unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, unix.IPPROTO_RAW)
+	if err != nil {
+		return -1, err
+	}
+	set := func(level, option, value int) {
+		if err == nil {
+			err = unix.SetsockoptInt(fd, level, option, value)
 		}
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetWriteDeadline(time.Now()) })
-	defer stop()
-	if err := ctx.Err(); err != nil {
-		return err
+	set(unix.SOL_SOCKET, unix.SO_MARK, int(DNSReplyMark))
+	if family == 4 {
+		set(unix.SOL_IP, unix.IP_TRANSPARENT, 1)
+		set(unix.SOL_IP, unix.IP_HDRINCL, 1)
+	} else {
+		set(unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1)
+		set(unix.SOL_IPV6, unix.IPV6_HDRINCL, 1)
 	}
-	_, err = conn.WriteTo(response, net.UDPAddrFromAddrPort(destination))
-	return err
+	if err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
 }
 
 type dnsSteering struct {

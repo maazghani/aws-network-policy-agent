@@ -91,6 +91,34 @@ func TestKernelEnforcement(t *testing.T) {
 		}
 	})
 	t.Run("socket steering and ingress isolation", func(t *testing.T) { f.steering(t) })
+	t.Run("CoreDNS Service DNAT and existing UDP conntrack", func(t *testing.T) {
+		backend := f.resolver
+		vip := netip.MustParseAddr("203.0.113.53")
+		command := "iptables"
+		mask := "32"
+		if f.family == 6 {
+			vip = netip.MustParseAddr("fd00:3::53")
+			command = "ip6tables"
+			mask = "128"
+		}
+		f.command("ip", fmt.Sprintf("-%d", f.family), "route", "add", vip.String()+"/"+mask, "dev", "fqdn-resolver")
+		for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+			for _, protocol := range []string{"udp", "tcp"} {
+				f.command(command, "-t", "nat", "-A", chain, "-d", vip.String(), "-p", protocol, "--dport", "53", "-j", "DNAT", "--to-destination", backend.String())
+			}
+		}
+		f.resolver = vip
+		// UDP probes deliberately reuse source port 32053. Baseline establishes
+		// real Linux NAT state before enrolling that exact tuple for interception.
+		f.steering(t)
+	})
+	t.Run("production DNS proxy and publication barrier", func(t *testing.T) { f.fullProxy(t) })
+	t.Run("NodeLocal resolver without SO_REUSEADDR", func(t *testing.T) {
+		f.resolver = f.pod.Prev() // Host side of the pod veth, bound by a real local resolver.
+		f.startResolver("")
+		f.static(f.resolver, 254, 53)
+		f.fullProxy(t)
+	})
 }
 
 func (f *fixture) proxyReady(ready uint32) {
@@ -134,9 +162,15 @@ func (f *fixture) steering(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tcp.Close()
-	cleanup,err:=fqdn.NewFQDNSteeringIntegration(f.family,fqdn.DefaultDNSMark,20153,1053)
-	if err!=nil{t.Fatal(err)}
-	defer func(){if err:=cleanup();err!=nil{t.Errorf("host steering cleanup: %v",err)}}()
+	cleanup, err := fqdn.NewFQDNSteeringIntegration(f.family, fqdn.DefaultDNSMark, 20153, 1053)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			t.Errorf("host steering cleanup: %v", err)
+		}
+	}()
 	errors := make(chan error, 100)
 	go f.serveTransparentUDP(udp, errors)
 	go f.serveTransparentTCP(tcp, errors)
@@ -153,7 +187,7 @@ func (f *fixture) steering(t *testing.T) {
 	key := append(u32(mask), ip...)
 	f.update("egress_map", key, make([]byte, 24*12))
 	for _, network := range []string{"udp", "tcp"} {
-		if result := f.probe(network+family, f.resolver, 53, 1); result.Success || (network=="tcp"&&result.Connected) {
+		if result := f.probe(network+family, f.resolver, 53, 1); result.Success || (network == "tcp" && result.Connected) {
 			t.Fatalf("transport-denied resolver admitted for %s", network)
 		}
 	}
@@ -179,6 +213,15 @@ func (f *fixture) steering(t *testing.T) {
 		t.Fatal(err)
 	default:
 	}
+	// Deleting the local route must not turn marked DNS into an ordinary
+	// forwarded request to the reachable resolver; the owned guard drops it.
+	f.command("ip", "-"+family, "route", "del", "local", "default", "dev", "lo", "table", "20153")
+	for _, network := range []string{"udp", "tcp"} {
+		if result := f.probe(network+family, f.resolver, 53, 1); result.Success || (network == "tcp" && result.Connected) {
+			t.Fatalf("route failure bypassed proxy for %s", network)
+		}
+	}
+	f.command("ip", "-"+family, "route", "add", "local", "default", "dev", "lo", "table", "20153", "proto", "153")
 	// Exercise abrupt listener loss with a stale kernel ready bit, as on crash.
 	_ = udp.Close()
 	_ = tcp.Close()
@@ -277,7 +320,9 @@ func (f *fixture) serveTransparentUDP(listener *net.UDPConn, failures chan<- err
 		lc := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
 			var result error
 			err := raw.Control(func(fd uintptr) {
-				if result=unix.SetsockoptInt(int(fd),unix.SOL_SOCKET,unix.SO_MARK,int(fqdn.DNSReplyMark));result!=nil{return}
+				if result = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, int(fqdn.DNSReplyMark)); result != nil {
+					return
+				}
 				if f.family == 4 {
 					result = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
 				} else {

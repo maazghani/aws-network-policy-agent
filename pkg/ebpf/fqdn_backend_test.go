@@ -3,6 +3,7 @@ package ebpf
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"reflect"
 	"testing"
@@ -248,5 +249,73 @@ func TestBulkRefreshReturnsDeletionFailure(t *testing.T) {
 	}
 	if _, ok := m.contents["key"]; !ok {
 		t.Fatal("failed deletion must remain retryable")
+	}
+}
+
+func TestFQDNDeleteIsIdempotentAndCannotInvalidateSuccessor(t *testing.T) {
+	b, ep := fqdnTestBackend()
+	ctx := context.Background()
+	if err := b.Replace(ctx, ep, 1, []fqdn.Grant{fqdnTestGrant()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete(ctx, ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete(ctx, ep); err != nil {
+		t.Fatal("retry failed", err)
+	}
+	successor := fqdnEndpointValue{Lifetime: 999, Generation: 1, Flags: fqdnEndpointSelected | fqdnEndpointReady}
+	_ = b.maps["fqdn_endpoints"].Put(fqdnUint32(ep.IfIndex), fqdnBytes(&successor))
+	if err := b.Delete(ctx, ep); err != nil {
+		t.Fatal(err)
+	}
+	var after fqdnEndpointValue
+	_ = b.maps["fqdn_endpoints"].Get(fqdnUint32(ep.IfIndex), fqdnBytes(&after))
+	if after != successor {
+		t.Fatal("old lifetime deletion modified successor")
+	}
+}
+func TestFQDNStaticOnlyAdmissionCannotUseDynamicGrant(t *testing.T) {
+	b, ep := fqdnTestBackend()
+	ctx := context.Background()
+	g := fqdnTestGrant()
+	if err := b.Replace(ctx, ep, 1, []fqdn.Grant{g}); err != nil {
+		t.Fatal(err)
+	}
+	g.Deadline = 0
+	if err := b.CheckStatic(ctx, ep, []fqdn.Grant{g}); err == nil {
+		t.Fatal("dynamic grant is not static permission")
+	}
+	b.readPolicy = func(fqdn.Endpoint, netip.Addr) (fqdnStaticPolicy, error) {
+		p := fqdnStaticPolicy{state: 0}
+		p.ports[0] = fqdnStaticPort{Protocol: 6, Start: 443}
+		return p, nil
+	}
+	if err := b.CheckStatic(ctx, ep, []fqdn.Grant{g}); err != nil {
+		t.Fatal("independent static grant should satisfy zero TTL", err)
+	}
+}
+func TestFQDNProofNamesNeverSilentlyTruncate(t *testing.T) {
+	names := []string{}
+	for i := 0; i < 40; i++ {
+		names = append(names, fmt.Sprintf("name-%d.example", i))
+	}
+	if got := appendUniqueNames(nil, names); len(got) != len(names) {
+		t.Fatal("truncated surviving contributor proof")
+	}
+}
+
+func TestFQDNFenceContextCannotBypassAfterPublication(t *testing.T) {
+	b, _ := fqdnTestBackend()
+	var saved context.Context
+	if err := b.WithFence(context.Background(), func(ctx context.Context) error { saved = ctx; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	b.gate <- struct{}{}
+	defer func() { <-b.gate }()
+	ctx, cancel := context.WithTimeout(saved, time.Millisecond)
+	defer cancel()
+	if err := b.WithFence(ctx, func(context.Context) error { t.Fatal("expired publication fence reused"); return nil }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
 	}
 }

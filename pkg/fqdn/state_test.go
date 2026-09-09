@@ -81,7 +81,7 @@ func (b *testBackend) Delete(_ context.Context, ep Endpoint) error {
 	return nil
 }
 
-func stateFixture(t *testing.T) (*Engine, *testBackend, *testClock, Endpoint) {
+func stateFixture(t testing.TB) (*Engine, *testBackend, *testClock, Endpoint) {
 	t.Helper()
 	clock := &testClock{}
 	clock.now.Store(uint64(time.Hour))
@@ -197,6 +197,24 @@ func TestCapacityFailureRevokesRemovedRulesAndRetainsSurvivors(t *testing.T) {
 	d, _ = e.Inspect(ep)
 	if len(d.Grants) != 0 {
 		t.Fatal("invalid policy preserved removed authority")
+	}
+}
+
+func TestL4ExpansionCapacityRevokesRemovedPortsAndRetainsSurvivor(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	e.config.Limits.MaxGrantsPerAddress = 2
+	old := []Rule{allowRule("removed", "api.example.com", 443), allowRule("survivor", "api.example.com", 8443)}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: old}); err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	update := []Rule{old[1], allowRule("new-a", "api.example.com", 22), allowRule("new-b", "api.example.com", 23)}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: update}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("expected L4 capacity error: %v", err)
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Grants) != 1 || d.Grants[0].StartPort != 8443 || len(d.Rules) != 1 {
+		t.Fatalf("L4 capacity failed survivor preservation: %+v", d)
 	}
 }
 
@@ -411,5 +429,146 @@ func TestSuspendAwareClockAndExplicitLimits(t *testing.T) {
 	}
 	if _, err := NewEngine(Config{}, newTestBackend()); !errors.Is(err, ErrCapacity) {
 		t.Fatal("missing qualified limits accepted")
+	}
+}
+
+type testStaticBackend struct {
+	*testBackend
+	allowed      bool
+	staticChecks int
+}
+
+func (b *testStaticBackend) CheckStatic(_ context.Context, ep Endpoint, grants []Grant) error {
+	b.staticChecks++
+	if !b.bound[ep.Lifetime] {
+		return ErrEndpoint
+	}
+	if !b.allowed {
+		return ErrNoPermission
+	}
+	if len(grants) == 0 {
+		return ErrNoPermission
+	}
+	return nil
+}
+
+func TestZeroTTLNeedsCurrentIndependentPermission(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	static := &testStaticBackend{testBackend: b, allowed: true}
+	e.backend = static
+	zero := observation(clock, "192.0.2.10", 0)
+	if ttl := publish(t, e, ep, zero); len(ttl) != 1 || ttl[0] != 0 {
+		t.Fatalf("zero TTL inflated: %v", ttl)
+	}
+	if len(b.grants[ep.Lifetime]) != 0 || static.staticChecks != 1 {
+		t.Fatal("zero TTL learned dynamic permission or skipped static check")
+	}
+	static.allowed = false
+	if err := e.Publish(context.Background(), ep, zero.Name, []Observation{zero}, func(context.Context, []uint32) error { t.Fatal("zero TTL bypassed static revocation"); return nil }); !errors.Is(err, ErrNoPermission) {
+		t.Fatal(err)
+	}
+}
+
+func TestCapacityCanUseIndependentStaticPermissionWithoutLearning(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	e.config.Limits.MaxObservationsPerEndpoint = 1
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	static := &testStaticBackend{testBackend: b, allowed: true}
+	e.backend = static
+	publish(t, e, ep, observation(clock, "192.0.2.11", time.Minute))
+	d, _ := e.Inspect(ep)
+	if len(d.Observations) != 1 || d.Observations[0].Address != netip.MustParseAddr("192.0.2.10") || static.staticChecks != 1 {
+		t.Fatalf("capacity fallback learned new permission: %+v", d)
+	}
+}
+
+func TestPolicyUpdateCancelsResponsePublication(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	inWrite := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- e.Publish(context.Background(), ep, "api.example.com", []Observation{observation(clock, "192.0.2.10", time.Minute)}, func(ctx context.Context, _ []uint32) error { close(inWrite); <-ctx.Done(); return ctx.Err() })
+	}()
+	<-inWrite
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("revoked response not canceled: %v", err)
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Grants) != 0 {
+		t.Fatal("removed policy retained grant")
+	}
+	if stats := e.Stats(); stats.Rules != 0 || stats.Grants != 0 || stats.Observations != 0 {
+		t.Fatalf("revocation accounting stale: %+v", stats)
+	}
+}
+
+func TestDeletionAccountingAndInputIdentityBounds(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	if err := e.Delete(context.Background(), ep); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.Stats()
+	if stats.Endpoints != 0 || stats.Rules != 0 || stats.Observations != 0 || stats.Grants != 0 || stats.Addresses != 0 {
+		t.Fatalf("deleted state retained accounting: %+v", stats)
+	}
+}
+
+func TestFailedFirstDNSProgrammingRecoversWithoutNewQueries(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	calls := 0
+	b.replace = func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return errors.New("transient first-write failure")
+		}
+		return nil
+	}
+	obs := observation(clock, "192.0.2.10", time.Minute)
+	if err := e.Publish(context.Background(), ep, obs.Name, []Observation{obs}, func(context.Context, []uint32) error { t.Fatal("failed first write published"); return nil }); err == nil {
+		t.Fatal("missing write error")
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Observations) != 0 {
+		t.Fatal("failed learning retained")
+	}
+	if err := e.Expire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("periodic recovery did not restore empty snapshot: %d writes", calls)
+	}
+	publish(t, e, ep, obs)
+}
+
+func TestOnlySuccessfullyAppliedPolicyRejectionIsRecoverable(t *testing.T) {
+	e, b, _, ep := stateFixture(t)
+	invalid := Snapshot{Rules: []Rule{{Owner: "bad", Name: "*"}}}
+	err := e.UpdatePolicy(context.Background(), ep, invalid)
+	if !IsPolicyRejected(err) || !errors.Is(err, ErrPolicy) {
+		t.Fatalf("successful restrictive rejection not classified: %v", err)
+	}
+	b.replace = func(context.Context) error { return ErrCapacity }
+	err = e.UpdatePolicy(context.Background(), ep, invalid)
+	if IsPolicyRejected(err) {
+		t.Fatal("failed kernel write misclassified as safe applied rejection")
+	}
+}
+
+// This benchmark measures only the userspace engine with an in-memory backend.
+// It is not a DNS QPS, BPF admission, packet-cost, or production budget claim.
+func BenchmarkStatePublishOneAddress(b *testing.B) {
+	e, _, clock, ep := stateFixture(b)
+	answer := []Observation{observation(clock, "192.0.2.10", time.Hour)}
+	write := func(context.Context, []uint32) error { return nil }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := e.Publish(context.Background(), ep, answer[0].Name, answer, write); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

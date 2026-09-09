@@ -123,7 +123,7 @@ func main() {
 
 		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
 			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
-		ebpfClient.ReAttachEbpfProbes()
+		lo.Must0(ebpfClient.ReAttachEbpfProbes())
 
 		var fqdnHandler *controllers.FQDNPolicyHandler
 		if ctrlConfig.FQDN.Enabled {
@@ -161,7 +161,14 @@ func main() {
 				defer proxy.Close()
 				ticker := time.NewTicker(2 * time.Second)
 				defer ticker.Stop()
+				var lastPlumbingCheck time.Time
 				for {
+					if proxy.Ready() && time.Since(lastPlumbingCheck) >= 10*time.Second {
+						lastPlumbingCheck = time.Now()
+						if err := proxy.Reconcile(run); err != nil {
+							log.Errorf("FQDN proxy plumbing reconciliation: %v", err)
+						}
+					}
 					if !proxy.Ready() {
 						if err := proxy.Close(); err != nil {
 							log.Errorf("FQDN proxy cleanup: %v", err)

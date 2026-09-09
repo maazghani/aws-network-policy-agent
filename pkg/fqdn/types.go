@@ -17,6 +17,21 @@ var (
 	ErrNoPermission = errors.New("FQDN answer has no effective permission")
 )
 
+// RejectedPolicyError means invalid/oversized contributions were rejected, but
+// removed permissions were revoked and surviving proven rules were installed.
+// A controller may finish its shared-static transaction on this error. Kernel
+// programming failures are never wrapped in this type.
+type RejectedPolicyError struct{ Cause error }
+
+func (e *RejectedPolicyError) Error() string {
+	return "FQDN policy partially rejected after restrictive update: " + e.Cause.Error()
+}
+func (e *RejectedPolicyError) Unwrap() error { return e.Cause }
+func IsPolicyRejected(err error) bool {
+	var rejected *RejectedPolicyError
+	return errors.As(err, &rejected)
+}
+
 // Endpoint is an immutable workload/interface lifetime. IP and ifindex alone
 // cannot identify it: both are reusable. Lifetime is assigned by Engine.Enroll.
 type Endpoint struct {
@@ -64,6 +79,12 @@ type Grant struct {
 
 type PolicyBackend interface {
 	ReconcilePolicy(context.Context, Endpoint, Snapshot) error
+}
+
+// StaticBackend can prove an answer independently of DNS-derived permission,
+// including zero-TTL answers and learning rejected because capacity is full.
+type StaticBackend interface {
+	CheckStatic(context.Context, Endpoint, []Grant) error
 }
 
 // Backend methods are synchronous. WithFence serializes shared static policy
