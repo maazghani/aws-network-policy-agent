@@ -1,0 +1,636 @@
+package fqdn
+
+import (
+	"context"
+	"errors"
+	"net/netip"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type testClock struct{ now atomic.Uint64 }
+
+func (c *testClock) Now() (uint64, error) { return c.now.Load(), nil }
+
+type testBackend struct {
+	gate      chan struct{}
+	mu        sync.Mutex
+	grants    map[uint64][]Grant
+	bound     map[uint64]bool
+	checks    int
+	deny      netip.Addr
+	replace   func(context.Context) error
+	deleteErr error
+}
+
+func newTestBackend() *testBackend {
+	return &testBackend{gate: make(chan struct{}, 1), grants: make(map[uint64][]Grant), bound: make(map[uint64]bool)}
+}
+func (b *testBackend) WithFence(ctx context.Context, f func(context.Context) error) error {
+	if err := acquire(ctx, b.gate); err != nil {
+		return err
+	}
+	defer release(b.gate)
+	return f(ctx)
+}
+func (b *testBackend) Bind(_ context.Context, ep Endpoint) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.bound[ep.Lifetime] = true
+	return nil
+}
+func (b *testBackend) Replace(ctx context.Context, ep Endpoint, _ uint64, grants []Grant) error {
+	if b.replace != nil {
+		if err := b.replace(ctx); err != nil {
+			return err
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.bound[ep.Lifetime] {
+		return ErrEndpoint
+	}
+	b.grants[ep.Lifetime] = slices.Clone(grants)
+	return nil
+}
+func (b *testBackend) Check(_ context.Context, ep Endpoint, _ uint64, grants []Grant) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.checks++
+	if !b.bound[ep.Lifetime] {
+		return ErrEndpoint
+	}
+	for _, g := range grants {
+		if g.Address == b.deny {
+			return ErrNoPermission
+		}
+	}
+	return nil
+}
+func (b *testBackend) Delete(_ context.Context, ep Endpoint) error {
+	if b.deleteErr != nil {
+		return b.deleteErr
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.bound, ep.Lifetime)
+	delete(b.grants, ep.Lifetime)
+	return nil
+}
+
+func stateFixture(t testing.TB) (*Engine, *testBackend, *testClock, Endpoint) {
+	t.Helper()
+	clock := &testClock{}
+	clock.now.Store(uint64(time.Hour))
+	backend := newTestBackend()
+	engine, err := NewEngine(Config{Clock: clock, PublicationTimeout: time.Second, Limits: Limits{MaxEndpoints: 8, MaxRulesPerEndpoint: 8, MaxObservationsPerEndpoint: 8, MaxAddressesPerEndpoint: 8, MaxGrantsPerAddress: 8, MaxGrantsPerEndpoint: 16, MaxTotalObservations: 32, MaxTotalGrants: 64}}, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep, err := engine.Enroll(context.Background(), Endpoint{UID: "pod-a", IfIndex: 10, IP: netip.MustParseAddr("10.0.0.10")}, Snapshot{Rules: []Rule{allowRule("owner-a", "*.example.com", 443)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine, backend, clock, ep
+}
+func allowRule(owner, name string, port uint16) Rule {
+	return Rule{Owner: owner, Name: name, Ports: []PortRange{{Protocol: 6, StartPort: port, EndPort: port}}}
+}
+func observation(clock *testClock, address string, ttl time.Duration) Observation {
+	return Observation{Name: "api.example.com", Address: netip.MustParseAddr(address), ExpiresAt: clock.now.Load() + uint64(ttl)}
+}
+func publish(t *testing.T, e *Engine, ep Endpoint, obs ...Observation) []uint32 {
+	t.Helper()
+	var ttls []uint32
+	if err := e.Publish(context.Background(), ep, "api.example.com", obs, func(_ context.Context, values []uint32) error { ttls = values; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return ttls
+}
+
+func TestEndpointIsolationAndLifetimeReuse(t *testing.T) {
+	e, b, clock, a := stateFixture(t)
+	second := a
+	second.UID = "pod-b"
+	second.IfIndex = 11
+	second.IP = netip.MustParseAddr("10.0.0.11")
+	second, err := e.Enroll(context.Background(), second, Snapshot{Rules: []Rule{allowRule("owner-a", "*.example.com", 443)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, a, observation(clock, "192.0.2.10", time.Minute))
+	if len(b.grants[a.Lifetime]) != 1 || len(b.grants[second.Lifetime]) != 0 {
+		t.Fatal("sibling inherited grants")
+	}
+	replacement, err := e.Enroll(context.Background(), a, Snapshot{Rules: []Rule{allowRule("owner-a", "*.example.com", 443)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Lifetime == a.Lifetime {
+		t.Fatal("interface lifetime was reused")
+	}
+	if err = e.Publish(context.Background(), a, "api.example.com", nil, func(context.Context, []uint32) error { t.Fatal("stale endpoint published"); return nil }); !errors.Is(err, ErrEndpoint) {
+		t.Fatal(err)
+	}
+	if len(b.grants[replacement.Lifetime]) != 0 {
+		t.Fatal("replacement inherited grants")
+	}
+	if _, ok := e.Lookup(replacement.IfIndex, second.IP); ok {
+		t.Fatal("source identity spoof accepted")
+	}
+}
+
+func TestPolicyOwnershipCompositionAndImmutability(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	rules := []Rule{allowRule("owner-a", "*.example.com", 443), allowRule("owner-b", "api.example.com", 8443)}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: rules}); err != nil {
+		t.Fatal(err)
+	}
+	rules[0].Ports[0].StartPort = 22
+	rules[0].Name = "other.example.com"
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	d, err := e.Inspect(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Grants) != 2 || d.Grants[0].StartPort != 443 {
+		t.Fatalf("snapshot was mutable or ports lost: %+v", d.Grants)
+	}
+	if err = e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: []Rule{allowRule("owner-b", "api.example.com", 8443)}}); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = e.Inspect(ep)
+	if len(d.Grants) != 1 || d.Grants[0].StartPort != 8443 {
+		t.Fatalf("contributor removal damaged surviving rule: %+v", d.Grants)
+	}
+	d.Grants[0].Names[0] = "mutated.example.com"
+	d, _ = e.Inspect(ep)
+	if d.Grants[0].Names[0] != "api.example.com" {
+		t.Fatal("diagnostic mutates state")
+	}
+}
+
+func TestCapacityFailureRevokesRemovedRulesAndRetainsSurvivors(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	old := []Rule{allowRule("removed", "api.example.com", 443), allowRule("survivor", "api.example.com", 8443)}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: old}); err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	oversized := []Rule{old[1]}
+	for i := 0; i < e.Limits().MaxRulesPerEndpoint; i++ {
+		oversized = append(oversized, allowRule("new", "other.example.com", 1234))
+	}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: oversized}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("expected capacity error: %v", err)
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Rules) != 1 || d.Rules[0].Owner != "survivor" || len(d.Grants) != 1 || d.Grants[0].StartPort != 8443 {
+		t.Fatalf("capacity rejection preserved revoked authority: %+v", d)
+	}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: []Rule{{Owner: "broken", Name: "*"}}}); !errors.Is(err, ErrPolicy) {
+		t.Fatal(err)
+	}
+	d, _ = e.Inspect(ep)
+	if len(d.Grants) != 0 {
+		t.Fatal("invalid policy preserved removed authority")
+	}
+}
+
+func TestL4ExpansionCapacityRevokesRemovedPortsAndRetainsSurvivor(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	e.config.Limits.MaxGrantsPerAddress = 2
+	old := []Rule{allowRule("removed", "api.example.com", 443), allowRule("survivor", "api.example.com", 8443)}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: old}); err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	update := []Rule{old[1], allowRule("new-a", "api.example.com", 22), allowRule("new-b", "api.example.com", 23)}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: update}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("expected L4 capacity error: %v", err)
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Grants) != 1 || d.Grants[0].StartPort != 8443 || len(d.Rules) != 1 {
+		t.Fatalf("L4 capacity failed survivor preservation: %+v", d)
+	}
+}
+
+func TestRotationExpiryAndTTLBarrier(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	old := observation(clock, "192.0.2.10", 10*time.Second)
+	if ttl := publish(t, e, ep, old); len(ttl) != 1 || ttl[0] != 10 {
+		t.Fatal(ttl)
+	}
+	clock.now.Add(uint64(5 * time.Second))
+	publish(t, e, ep, observation(clock, "192.0.2.11", time.Minute))
+	d, _ := e.Inspect(ep)
+	if len(d.Observations) != 2 {
+		t.Fatal("rotation discarded still valid absent address")
+	}
+	for _, g := range d.Grants {
+		if g.Address == old.Address && g.Deadline != old.ExpiresAt {
+			t.Fatal("rotation renewed absent address")
+		}
+	}
+	clock.now.Add(uint64(6 * time.Second))
+	if err := e.Expire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = e.Inspect(ep)
+	if len(d.Grants) != 1 || d.Grants[0].Address == old.Address {
+		t.Fatal("expired observation retained")
+	}
+	zero := observation(clock, "192.0.2.12", 0)
+	if err := e.Publish(context.Background(), ep, zero.Name, []Observation{zero}, func(context.Context, []uint32) error { t.Fatal("zero TTL released"); return nil }); !errors.Is(err, ErrExpired) {
+		t.Fatal(err)
+	}
+}
+
+func TestNoPositiveAnswerBeforeEveryEffectiveAddressAndDuplicateCheck(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	first, second := observation(clock, "192.0.2.10", time.Minute), observation(clock, "192.0.2.11", time.Minute)
+	b.deny = second.Address
+	if err := e.Publish(context.Background(), ep, first.Name, []Observation{first, second}, func(context.Context, []uint32) error { t.Fatal("partially denied answer released"); return nil }); !errors.Is(err, ErrNoPermission) {
+		t.Fatal(err)
+	}
+	b.deny = netip.Addr{}
+	publish(t, e, ep, first, second)
+	publish(t, e, ep, first, second)
+	if b.checks != 3 {
+		t.Fatalf("duplicate response skipped current admission: %d checks", b.checks)
+	}
+}
+
+func TestProgrammingFailureAndExpirationSuppressPositiveAnswer(t *testing.T) {
+	for _, mode := range []string{"write-fails", "expires-during-write", "attachment-lost", "timeout"} {
+		t.Run(mode, func(t *testing.T) {
+			e, b, clock, ep := stateFixture(t)
+			obs := observation(clock, "192.0.2.10", time.Second)
+			e.config.PublicationTimeout = 20 * time.Millisecond
+			b.replace = func(ctx context.Context) error {
+				switch mode {
+				case "write-fails":
+					return errors.New("map write failed")
+				case "expires-during-write":
+					clock.now.Add(uint64(2 * time.Second))
+				case "attachment-lost":
+					b.mu.Lock()
+					b.bound[ep.Lifetime] = false
+					b.mu.Unlock()
+				case "timeout":
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			}
+			if err := e.Publish(context.Background(), ep, obs.Name, []Observation{obs}, func(context.Context, []uint32) error { t.Fatal("premature positive answer"); return nil }); err == nil {
+				t.Fatal("expected admission failure")
+			}
+		})
+	}
+}
+
+func TestDeletionCancelsPendingPublicationAndCanRetryFailedCleanup(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	entered := make(chan struct{})
+	b.replace = func(ctx context.Context) error { close(entered); <-ctx.Done(); return ctx.Err() }
+	result := make(chan error, 1)
+	go func() {
+		result <- e.Publish(context.Background(), ep, "api.example.com", []Observation{observation(clock, "192.0.2.10", time.Minute)}, func(context.Context, []uint32) error { return errors.New("response should have been canceled") })
+	}()
+	<-entered
+	b.deleteErr = errors.New("delete failed")
+	if err := e.Delete(context.Background(), ep); err == nil {
+		t.Fatal("unmodifiable kernel falsely reported revoked")
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("pending write not canceled: %v", err)
+	}
+	if _, ok := e.Lookup(ep.IfIndex, ep.IP); ok {
+		t.Fatal("deleted identity still usable")
+	}
+	b.deleteErr = nil
+	if err := e.Delete(context.Background(), ep); err != nil {
+		t.Fatalf("physical cleanup cannot retry: %v", err)
+	}
+}
+
+func TestPublicationFenceCoversResponseWriteAndStatsStayPrompt(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	inWrite, finish := make(chan struct{}), make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- e.Publish(context.Background(), ep, "api.example.com", []Observation{observation(clock, "192.0.2.10", time.Minute)}, func(ctx context.Context, _ []uint32) error {
+			close(inWrite)
+			select {
+			case <-finish:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+	<-inWrite
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := b.WithFence(ctx, func(context.Context) error { t.Fatal("static update crossed response barrier"); return nil }); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	statsReturned := make(chan struct{})
+	go func() { _ = e.Stats(); close(statsReturned) }()
+	select {
+	case <-statsReturned:
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("metrics blocked on DNS publication")
+	}
+	close(finish)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedRevocationCanRebindOnRetry(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	b.replace = func(context.Context) error { return errors.New("transient write failure") }
+	snapshot := Snapshot{Rules: []Rule{allowRule("new", "api.example.com", 8443)}}
+	if err := e.UpdatePolicy(context.Background(), ep, snapshot); err == nil {
+		t.Fatal("expected failed revocation")
+	}
+	b.replace = nil
+	if err := e.UpdatePolicy(context.Background(), ep, snapshot); err != nil {
+		t.Fatalf("retry cannot bind: %v", err)
+	}
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	d, _ := e.Inspect(ep)
+	if len(d.Grants) != 1 || d.Grants[0].StartPort != 8443 {
+		t.Fatal(d.Grants)
+	}
+}
+
+func TestPublishDNSMatchesCurrentPolicyUnderFence(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	obs := observation(clock, "192.0.2.10", time.Minute)
+	obs.Name = "other.test.com"
+	if err := e.PublishDNS(context.Background(), ep, obs.Name, []Observation{obs}, func(_ context.Context, matched bool, ttls []uint32) error {
+		if matched || len(ttls) != 0 {
+			t.Fatal("nonmatching answer learned")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := e.Inspect(ep); len(d.Grants) != 0 {
+		t.Fatal("informational answer grants access")
+	}
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{Rules: []Rule{allowRule("new", obs.Name, 443)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.PublishDNS(context.Background(), ep, obs.Name, []Observation{obs}, func(_ context.Context, matched bool, ttls []uint32) error {
+		if !matched || len(ttls) != 1 {
+			t.Fatal("newly matching answer bypassed admission")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGlobalCapacityReclaimsExpiredOtherEndpoint(t *testing.T) {
+	e, _, clock, a := stateFixture(t)
+	e.config.Limits.MaxTotalObservations = 1
+	second := a
+	second.UID = "pod-b"
+	second.IfIndex = 11
+	second.IP = netip.MustParseAddr("10.0.0.11")
+	second, err := e.Enroll(context.Background(), second, Snapshot{Rules: []Rule{allowRule("owner-a", "*.example.com", 443)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, a, observation(clock, "192.0.2.10", time.Second))
+	clock.now.Add(uint64(2 * time.Second))
+	publish(t, e, second, observation(clock, "192.0.2.11", time.Minute))
+	if got := e.Stats().Observations; got != 1 {
+		t.Fatalf("expired capacity not reclaimed: %d", got)
+	}
+}
+
+func TestSuspendAwareClockAndExplicitLimits(t *testing.T) {
+	before, err := (BootClock{}).Now()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := (BootClock{}).Now()
+	if err != nil || after < before || before == 0 {
+		t.Fatalf("invalid boot clock %d %d %v", before, after, err)
+	}
+	if _, err := NewEngine(Config{}, newTestBackend()); !errors.Is(err, ErrCapacity) {
+		t.Fatal("missing qualified limits accepted")
+	}
+}
+
+type testStaticBackend struct {
+	*testBackend
+	allowed      bool
+	staticChecks int
+}
+
+func (b *testStaticBackend) CheckStatic(_ context.Context, ep Endpoint, grants []Grant) error {
+	b.staticChecks++
+	if !b.bound[ep.Lifetime] {
+		return ErrEndpoint
+	}
+	if !b.allowed {
+		return ErrNoPermission
+	}
+	if len(grants) == 0 {
+		return ErrNoPermission
+	}
+	return nil
+}
+
+func TestZeroTTLNeedsCurrentIndependentPermission(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	static := &testStaticBackend{testBackend: b, allowed: true}
+	e.backend = static
+	zero := observation(clock, "192.0.2.10", 0)
+	if ttl := publish(t, e, ep, zero); len(ttl) != 1 || ttl[0] != 0 {
+		t.Fatalf("zero TTL inflated: %v", ttl)
+	}
+	if len(b.grants[ep.Lifetime]) != 0 || static.staticChecks != 1 {
+		t.Fatal("zero TTL learned dynamic permission or skipped static check")
+	}
+	static.allowed = false
+	if err := e.Publish(context.Background(), ep, zero.Name, []Observation{zero}, func(context.Context, []uint32) error { t.Fatal("zero TTL bypassed static revocation"); return nil }); !errors.Is(err, ErrNoPermission) {
+		t.Fatal(err)
+	}
+}
+
+func TestCapacityCanUseIndependentStaticPermissionWithoutLearning(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	e.config.Limits.MaxObservationsPerEndpoint = 1
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	static := &testStaticBackend{testBackend: b, allowed: true}
+	e.backend = static
+	publish(t, e, ep, observation(clock, "192.0.2.11", time.Minute))
+	d, _ := e.Inspect(ep)
+	if len(d.Observations) != 1 || d.Observations[0].Address != netip.MustParseAddr("192.0.2.10") || static.staticChecks != 1 {
+		t.Fatalf("capacity fallback learned new permission: %+v", d)
+	}
+}
+
+func TestPolicyUpdateCancelsResponsePublication(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	inWrite := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- e.Publish(context.Background(), ep, "api.example.com", []Observation{observation(clock, "192.0.2.10", time.Minute)}, func(ctx context.Context, _ []uint32) error { close(inWrite); <-ctx.Done(); return ctx.Err() })
+	}()
+	<-inWrite
+	if err := e.UpdatePolicy(context.Background(), ep, Snapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("revoked response not canceled: %v", err)
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Grants) != 0 {
+		t.Fatal("removed policy retained grant")
+	}
+	if stats := e.Stats(); stats.Rules != 0 || stats.Grants != 0 || stats.Observations != 0 {
+		t.Fatalf("revocation accounting stale: %+v", stats)
+	}
+}
+
+func TestDeletionAccountingAndInputIdentityBounds(t *testing.T) {
+	e, _, clock, ep := stateFixture(t)
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute))
+	if err := e.Delete(context.Background(), ep); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.Stats()
+	if stats.Endpoints != 0 || stats.Rules != 0 || stats.Observations != 0 || stats.Grants != 0 || stats.Addresses != 0 {
+		t.Fatalf("deleted state retained accounting: %+v", stats)
+	}
+}
+
+func TestFailedFirstDNSProgrammingRecoversWithoutNewQueries(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	calls := 0
+	b.replace = func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return errors.New("transient first-write failure")
+		}
+		return nil
+	}
+	obs := observation(clock, "192.0.2.10", time.Minute)
+	if err := e.Publish(context.Background(), ep, obs.Name, []Observation{obs}, func(context.Context, []uint32) error { t.Fatal("failed first write published"); return nil }); err == nil {
+		t.Fatal("missing write error")
+	}
+	d, _ := e.Inspect(ep)
+	if len(d.Observations) != 0 {
+		t.Fatal("failed learning retained")
+	}
+	if err := e.Expire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("periodic recovery did not restore empty snapshot: %d writes", calls)
+	}
+	publish(t, e, ep, obs)
+}
+
+func TestOnlySuccessfullyAppliedPolicyRejectionIsRecoverable(t *testing.T) {
+	e, b, _, ep := stateFixture(t)
+	invalid := Snapshot{Rules: []Rule{{Owner: "bad", Name: "*"}}}
+	err := e.UpdatePolicy(context.Background(), ep, invalid)
+	if !IsPolicyRejected(err) || !errors.Is(err, ErrPolicy) {
+		t.Fatalf("successful restrictive rejection not classified: %v", err)
+	}
+	b.replace = func(context.Context) error { return ErrCapacity }
+	err = e.UpdatePolicy(context.Background(), ep, invalid)
+	if IsPolicyRejected(err) {
+		t.Fatal("failed kernel write misclassified as safe applied rejection")
+	}
+}
+
+func TestCapacityFallbackValidatesAllReturnedAddressesBeforePublication(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	e.config.Limits.MaxObservationsPerEndpoint = 2
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Minute), observation(clock, "192.0.2.11", time.Minute))
+	static := &testStaticBackend{testBackend: b, allowed: true}
+	e.backend = static
+	answer := []Observation{observation(clock, "192.0.2.12", time.Minute), observation(clock, "0.0.0.0", time.Minute)}
+	if err := e.Publish(context.Background(), ep, "api.example.com", answer, func(context.Context, []uint32) error {
+		t.Fatal("capacity fallback released unvalidated later address")
+		return nil
+	}); !errors.Is(err, ErrNoPermission) {
+		t.Fatal(err)
+	}
+	if static.staticChecks != 0 {
+		t.Fatal("invalid answer reached static fallback")
+	}
+}
+
+func TestExpiryPassHasOneTotalMaintenanceDeadline(t *testing.T) {
+	e, b, clock, first := stateFixture(t)
+	second := first
+	second.UID = "pod-b"
+	second.IfIndex++
+	second.IP = netip.MustParseAddr("10.0.0.11")
+	second, err := e.Enroll(context.Background(), second, Snapshot{Rules: []Rule{allowRule("owner", "api.example.com", 443)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish(t, e, first, observation(clock, "192.0.2.10", time.Second))
+	publish(t, e, second, observation(clock, "192.0.2.11", time.Second))
+	clock.now.Add(uint64(2 * time.Second))
+	e.config.PublicationTimeout = 20 * time.Millisecond
+	calls := 0
+	b.replace = func(ctx context.Context) error { calls++; <-ctx.Done(); return ctx.Err() }
+	if err := e.Expire(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expiry multiplied timeout across endpoints: %d blocked operations", calls)
+	}
+}
+
+func TestFailedProgrammingDoesNotCountUnreclaimedExpiry(t *testing.T) {
+	e, b, clock, ep := stateFixture(t)
+	publish(t, e, ep, observation(clock, "192.0.2.10", time.Second))
+	clock.now.Add(uint64(2 * time.Second))
+	b.replace = func(context.Context) error { return errors.New("map unavailable") }
+	if err := e.Publish(context.Background(), ep, "api.example.com", []Observation{observation(clock, "192.0.2.11", time.Minute)}, func(context.Context, []uint32) error { return nil }); err == nil {
+		t.Fatal("expected map failure")
+	}
+	if e.Stats().Expired != 0 {
+		t.Fatal("failed cleanup overcounted reclaimed expiry")
+	}
+	b.replace = nil
+	if err := e.Expire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if e.Stats().Expired != 1 {
+		t.Fatal("successful expiry not counted")
+	}
+}
+
+// This benchmark measures only the userspace engine with an in-memory backend.
+// It is not a DNS QPS, BPF admission, packet-cost, or production budget claim.
+func BenchmarkStatePublishOneAddress(b *testing.B) {
+	e, _, clock, ep := stateFixture(b)
+	answer := []Observation{observation(clock, "192.0.2.10", time.Hour)}
+	write := func(context.Context, []uint32) error { return nil }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := e.Publish(context.Background(), ep, answer[0].Name, answer, write); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

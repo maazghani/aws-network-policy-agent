@@ -1,0 +1,58 @@
+name: FQDN kernel qualification
+
+on:
+  push:
+    branches: [main]
+    paths: ['pkg/fqdn/**', 'pkg/ebpf/**', 'test/fqdn/**', 'scripts/fqdn*', '.github/workflows/fqdn-validation.yaml', 'go.mod', 'go.sum']
+  pull_request:
+    paths: ['pkg/fqdn/**', 'pkg/ebpf/**', 'test/fqdn/**', 'scripts/fqdn*', '.github/workflows/fqdn-validation.yaml', 'go.mod', 'go.sum']
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install kernel test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-common linux-tools-generic iproute2 iptables tcpdump
+          # Ubuntu's bpftool wrapper may demand a package matching the hosted
+          # kernel. Select the packaged executable directly when available.
+          bpftool_binary=$(find -L /usr/lib/linux-tools -type f -name bpftool | sort | tail -n 1)
+          test -n "$bpftool_binary"
+          sudo ln -sf "$bpftool_binary" /usr/local/bin/bpftool
+      - name: Record qualification environment
+        run: |
+          mkdir -p test-results
+          { uname -a; go version; clang --version; ip -Version; sudo bpftool feature probe kernel; } > test-results/environment.txt 2>&1
+      - name: Real TC and socket assignment, IPv4 and IPv6
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOPATH=$(go env GOPATH)" ./scripts/fqdn-kernel-tests.sh 2>&1 | tee test-results/kernel.txt
+      - name: Restore runner ownership of shared Go caches
+        if: always()
+        run: |
+          # The privileged test build shares this disposable runner's caches.
+          # Return new root-owned entries before unprivileged race tests/cache save.
+          sudo chown -R "$(id -u):$(id -g)" "$(go env GOCACHE)" "$(go env GOPATH)/pkg/mod"
+      - name: Unit tests and parser fuzz seeds
+        run: |
+          set -o pipefail
+          go test -race ./pkg/fqdn/... ./pkg/ebpf/... | tee test-results/unit.txt
+      - name: Userspace microbenchmarks (kernel I/O excluded)
+        run: |
+          set -o pipefail
+          go test ./test/fqdn -run '^$' -bench . -benchtime=200ms -benchmem | tee test-results/microbenchmarks.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fqdn-kernel-evidence
+          path: test-results/

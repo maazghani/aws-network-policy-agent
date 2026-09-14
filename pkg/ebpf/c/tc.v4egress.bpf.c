@@ -334,8 +334,9 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 }
 
 
-SEC("tc_cls")
-int handle_egress(struct __sk_buff *skb)
+#include "fqdn_egress.h"
+
+static __noinline int legacy_handle_egress(struct __sk_buff *skb)
 {
 	struct keystruct trie_key;
 	__u32 l4_src_port = 0;
@@ -363,7 +364,7 @@ int handle_egress(struct __sk_buff *skb)
 		struct iphdr *ip = data;
 		struct tcphdr *l4_tcp_hdr = data + sizeof(struct iphdr);
 		struct udphdr *l4_udp_hdr = data + sizeof(struct iphdr);
-		struct sctphdr *l4_sctp_hdr = data + sizeof(struct iphdr);
+		struct aws_sctphdr *l4_sctp_hdr = data + sizeof(struct iphdr);
 
 		if (data + sizeof(*ip) > data_end) {
 			return BPF_OK;
@@ -491,5 +492,15 @@ int handle_egress(struct __sk_buff *skb)
 	return BPF_OK;
 }
 
-const volatile __u32 NPA_FILE_VERSION = 2;
+/* Keep the legacy and enrolled paths in separate stack frames. */
+SEC("tc_cls")
+int handle_egress(struct __sk_buff *skb)
+{
+    int result = fqdn_handle_egress(skb);
+    if (result != FQDN_DEFER)
+        return result;
+    return legacy_handle_egress(skb);
+}
+
+const volatile __u32 NPA_FILE_VERSION = 3;
 char _license[] SEC("license") = "GPL";

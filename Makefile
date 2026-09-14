@@ -98,8 +98,11 @@ build: manifests generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./main.go
 
+GO_ARCH ?= $(shell go env GOARCH)
+CGO_ENABLED ?= 1
+
 GO_ENV_EBPF =
-GO_ENV_EBPF += CGO_ENABLED=1
+GO_ENV_EBPF += CGO_ENABLED=$(CGO_ENABLED)
 GO_ENV_EBPF += GOOS=linux
 GO_ENV_EBPF += GOARCH=$(GO_ARCH)
 GO_ENV_EBPF += CGO_CFLAGS=$(CUSTOM_CGO_CFLAGS)
@@ -121,8 +124,8 @@ BUILD_MODE ?= -buildmode=pie
 build-linux: BUILD_FLAGS = $(BUILD_MODE) -ldflags '-s -w $(LDFLAGS) $(VERSION_LDFLAGS) -extldflags "-static"'
 build-linux: ## Build the controllerusing the host's Go toolchain.
 	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -a -o controller main.go
-	go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -o aws-eks-na-cli ./cmd/cli
-	go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -o aws-eks-na-cli-v6 ./cmd/cliv6
+	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -o aws-eks-na-cli ./cmd/cli
+	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -o aws-eks-na-cli-v6 ./cmd/cliv6
 
 
 CMD_MKDIR ?= mkdir
@@ -158,12 +161,12 @@ EBPF_V6_EVENTS_SOURCE_TC := ./pkg/ebpf/c/v6events.bpf.c
 EBPF_V6_EVENTS_BINARY_TC := ./pkg/ebpf/c/v6events.bpf.o
 
 build-bpf: ## Build BPF.
-	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_x86 -c $(EBPF_EVENTS_SOURCE_TC) -o $(EBPF_EVENTS_BINARY_TC)
-	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_x86 -c $(EBPF_V6_EVENTS_SOURCE_TC) -o $(EBPF_V6_EVENTS_BINARY_TC)
-	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_INGRESS_TC) -o $(EBPF_BINARY_INGRESS_TC)
-	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_EGRESS_TC) -o $(EBPF_BINARY_EGRESS_TC)
-	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_V6_INGRESS_TC) -o $(EBPF_BINARY_V6_INGRESS_TC)
-	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -march=bpf -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_V6_EGRESS_TC) -o $(EBPF_BINARY_V6_EGRESS_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -mcpu=$(BPF_VCPU) -D__TARGET_ARCH_x86 -c $(EBPF_EVENTS_SOURCE_TC) -o $(EBPF_EVENTS_BINARY_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -mcpu=$(BPF_VCPU) -D__TARGET_ARCH_x86 -c $(EBPF_V6_EVENTS_SOURCE_TC) -o $(EBPF_V6_EVENTS_BINARY_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -mcpu=$(BPF_VCPU) -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_INGRESS_TC) -o $(EBPF_BINARY_INGRESS_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -mcpu=$(BPF_VCPU) -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_EGRESS_TC) -o $(EBPF_BINARY_EGRESS_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -mcpu=$(BPF_VCPU) -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_V6_INGRESS_TC) -o $(EBPF_BINARY_V6_INGRESS_TC)
+	$(CMD_CLANG) $(CLANG_INCLUDE) -g -O2 -Wall -fpie -target bpf -DCORE -D__BPF_TRACING__ -mcpu=$(BPF_VCPU) -D__TARGET_ARCH_$(ARCH) -c $(EBPF_SOURCE_V6_EGRESS_TC) -o $(EBPF_BINARY_V6_EGRESS_TC)
 
 # If you wish built the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64 ). However, you must enable docker buildKit for it.

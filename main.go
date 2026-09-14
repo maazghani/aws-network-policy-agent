@@ -26,6 +26,7 @@ import (
 
 	cnirpc "github.com/aws/amazon-vpc-cni-k8s/rpc"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf"
+	"github.com/aws/aws-network-policy-agent/pkg/fqdn"
 	"github.com/aws/aws-network-policy-agent/pkg/rpc"
 	"github.com/aws/aws-network-policy-agent/pkg/rpcclient"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
@@ -50,6 +51,8 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -120,9 +123,74 @@ func main() {
 
 		ebpfClient := lo.Must1(ebpf.NewBpfClient(ctx, nodeIP, ctrlConfig.EnablePolicyEventLogs, ctrlConfig.EnableCloudWatchLogs,
 			ctrlConfig.EnableIPv6, ctrlConfig.ConntrackCacheCleanupPeriod, ctrlConfig.ConntrackCacheTableSize, npMode, isMultiNICEnabled, ctrlConfig.LogLevel))
-		ebpfClient.ReAttachEbpfProbes()
+		lo.Must0(ebpfClient.ReAttachEbpfProbes())
+
+		var fqdnHandler *controllers.FQDNPolicyHandler
+		if ctrlConfig.FQDN.Enabled {
+			cfg := ctrlConfig.FQDN
+			backend := lo.Must1(ebpf.NewFQDNBackend(ebpfClient))
+			go backend.RunGC(ctx)
+			engine := lo.Must1(fqdn.NewEngine(fqdn.Config{Limits: fqdn.Limits{
+				MaxEndpoints: cfg.MaxEndpoints, MaxRulesPerEndpoint: cfg.MaxRulesPerEndpoint,
+				MaxObservationsPerEndpoint: cfg.MaxObservationsPerEndpoint,
+				MaxAddressesPerEndpoint:    cfg.MaxAddressesPerEndpoint,
+				MaxGrantsPerAddress:        cfg.MaxGrantsPerAddress, MaxGrantsPerEndpoint: cfg.MaxGrantsPerEndpoint,
+				MaxTotalObservations: cfg.MaxTotalObservations, MaxTotalGrants: cfg.MaxTotalGrants,
+			}, PublicationTimeout: cfg.ExchangeTimeout}, backend))
+			family := 4
+			if ctrlConfig.EnableIPv6 {
+				family = 6
+			}
+			proxy := lo.Must1(fqdn.NewProxy(engine, backend, fqdn.ProxyConfig{
+				Port: cfg.Port, Family: family, MaxPending: cfg.MaxPending, MaxPendingBytes: cfg.MaxPendingBytes,
+				MaxTCPSockets: cfg.MaxTCPSockets, ExchangeTimeout: cfg.ExchangeTimeout, TCPIdleTimeout: cfg.TCPIdleTimeout,
+			}))
+			fqdnHandler = controllers.NewFQDNPolicyHandler(mgr.GetClient(), nodeIP, engine, backend)
+			lo.Must0(fqdnHandler.SetupWithManager(ctx, mgr))
+			lo.Must0(fqdn.RegisterMetrics(metrics.Registry, engine.Stats, proxy.Stats, proxy.Ready))
+			lo.Must0(mgr.AddReadyzCheck("fqdn-proxy", func(_ *http.Request) error {
+				if !proxy.Ready() {
+					return errors.New("FQDN DNS proxy is not ready")
+				}
+				return nil
+			}))
+			if cfg.Diagnostics {
+				lo.Must0(fqdn.ServeDiagnostics(ctx, engine, proxy))
+			}
+			lo.Must0(mgr.Add(manager.RunnableFunc(func(run context.Context) error {
+				defer proxy.Close()
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				var lastPlumbingCheck time.Time
+				for {
+					if proxy.Ready() && time.Since(lastPlumbingCheck) >= 10*time.Second {
+						lastPlumbingCheck = time.Now()
+						if err := proxy.Reconcile(run); err != nil {
+							log.Errorf("FQDN proxy plumbing reconciliation: %v", err)
+						}
+					}
+					if !proxy.Ready() {
+						if err := proxy.Close(); err != nil {
+							log.Errorf("FQDN proxy cleanup: %v", err)
+						}
+						if err := proxy.Start(run); err != nil {
+							log.Errorf("FQDN proxy unavailable; selected DNS remains blocked: %v", err)
+						}
+					}
+					if err := engine.Expire(run); err != nil {
+						log.Errorf("FQDN expiry cleanup: %v", err)
+					}
+					select {
+					case <-run.Done():
+						return nil
+					case <-ticker.C:
+					}
+				}
+			})))
+		}
 
 		policyEndpointController = controllers.NewPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient, ctrlConfig.EnableIPv6)
+		policyEndpointController.SetFQDNPolicyHandler(fqdnHandler)
 
 		if err = policyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller PolicyEndpoints %v", err)
@@ -130,6 +198,7 @@ func main() {
 		}
 
 		clusterPolicyEndpointController = controllers.NewClusterPolicyEndpointsReconciler(mgr.GetClient(), nodeIP, ebpfClient)
+		clusterPolicyEndpointController.SetFQDNPolicyHandler(fqdnHandler)
 		if err = clusterPolicyEndpointController.SetupWithManager(ctx, mgr); err != nil {
 			log.Errorf("unable to create controller ClusterPolicyEndpoints %v", err)
 			os.Exit(1)

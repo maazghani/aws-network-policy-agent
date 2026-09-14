@@ -1,6 +1,7 @@
 package cliv6
 
 import (
+	"github.com/aws/aws-network-policy-agent/pkg/clihelper"
 	"github.com/spf13/cobra"
 )
 
@@ -16,6 +17,7 @@ programs, qdiscs and so on`,
 
 func init() {
 	rootCmd.AddCommand(subCmd)
+	rootCmd.AddCommand(clihelper.NewFQDNCommand())
 }
 
 func Execute() error {

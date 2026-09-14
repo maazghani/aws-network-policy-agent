@@ -319,3 +319,28 @@ limitations under the License.
 
 If you think you’ve found a potential security issue, please do not post it in the Issues. Instead, please follow the
 instructions [here](https://aws.amazon.com/security/vulnerability-reporting/) or [email AWS security directly](mailto:aws-security@amazon.com).
+
+## Experimental FQDN egress
+
+`--enable-fqdn-egress` adds endpoint-specific DNS-derived egress permissions
+inside the existing `aws-eks-nodeagent` container. It is disabled by default and
+requires explicit resource limits. Domain-only `PolicyEndpoint` entries remain
+isolating when disabled; they do not become broad CIDR rules.
+
+See [the implementation contract](SPEC.md), [validation and qualification](docs/fqdn-validation.md),
+and the [VPC CNI chart patch](patches/amazon-vpc-cni-k8s/README.md).
+The [controller named-port fix](patches/amazon-network-policy-controller-k8s/README.md)
+is a prerequisite. This experimental image is not an AWS Standard EKS release or
+a claim of compatibility with an unqualified managed controller/add-on version.
+
+For opted-in nodes, DNS is forwarded to the workload's original permitted
+resolver. A matched positive answer waits for current endpoint, policy, active
+TC attachment, and effective BPF permission checks. Nonmatching names remain
+informational and create no permission. DNS transport needs its own static allow;
+FQDN policy authorizes IP/port access, not a TLS or HTTP identity.
+
+`aws-eks-na-cli fqdn` (also available in the IPv6 CLI) reads local diagnostics
+when the agent starts with `--fqdn-diagnostics`. Add `--ifindex` and `--ip` to
+inspect a single endpoint's owners, names, grants, and absolute boot-clock
+expirations. The existing metrics endpoint exposes bounded aggregate counters
+and stage latency without DNS names or endpoint IDs as labels.
